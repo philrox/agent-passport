@@ -1,0 +1,15 @@
+node_modules/
+.env
+out/
+cache/
+broadcast/
+forge-cache/
+.coverage
+.venv/
+__pycache__/
+*.pyc
+dist/
+build/
+
+# Local AI context (not committed)
+CLAUDE.md
