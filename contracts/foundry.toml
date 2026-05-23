@@ -7,7 +7,7 @@ libs = ["lib"]
 solc_version = "0.8.24"
 optimizer = true
 optimizer_runs = 200
-gas_reports = ["AgentPassport"]
+gas_reports = ["*"]
 remappings = [
     "@openzeppelin/=lib/openzeppelin-contracts/",
     "forge-std/=lib/forge-std/src/",
@@ -22,4 +22,5 @@ quote_style = "double"
 number_underscore = "thousands"
 
 [fuzz]
-runs = 256
+runs = 1_000
+max_test_rejects = 131_072
