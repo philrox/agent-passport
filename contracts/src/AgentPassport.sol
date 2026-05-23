@@ -195,9 +195,10 @@ contract AgentPassport {
         if (card.owner == address(0)) revert UnknownAgent(agentId);
         if (card.owner != msg.sender) revert NotOwner(agentId, msg.sender);
 
-        address owner = card.owner;
+        // card.owner is proven == msg.sender above; emit it directly to avoid
+        // re-reading the slot we're about to delete.
         delete _agents[agentId];
-        emit AgentRelinquished(agentId, owner);
+        emit AgentRelinquished(agentId, msg.sender);
     }
 
     /*//////////////////////////////////////////////////////////////
