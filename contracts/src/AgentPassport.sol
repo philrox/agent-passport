@@ -159,6 +159,7 @@ contract AgentPassport {
         address paymentAddress,
         string calldata metadataURI
     ) external {
+        if (agentId == bytes32(0)) revert ZeroAgentId();
         AgentCard storage card = _agents[agentId];
         if (card.owner == address(0)) revert UnknownAgent(agentId);
         if (card.owner != msg.sender) revert NotOwner(agentId, msg.sender);
@@ -189,6 +190,7 @@ contract AgentPassport {
     ///      relinquish, but that's no worse than the existing compromise.
     /// @param agentId The identifier to surrender. Must be registered to msg.sender.
     function relinquishAgent(bytes32 agentId) external {
+        if (agentId == bytes32(0)) revert ZeroAgentId();
         AgentCard storage card = _agents[agentId];
         if (card.owner == address(0)) revert UnknownAgent(agentId);
         if (card.owner != msg.sender) revert NotOwner(agentId, msg.sender);
