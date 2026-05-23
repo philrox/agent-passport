@@ -1,0 +1,7 @@
+# Default owner — required reviewer for all PRs from outside contributors.
+# Maintainers can self-merge their own PRs (per CONTRIBUTING.md).
+* @philrox
+
+# Standards-level files: explicit ownership to make accidental drift visible.
+/docs/SPEC.md @philrox
+/contracts/src/interfaces/ @philrox
