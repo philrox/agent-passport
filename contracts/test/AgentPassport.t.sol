@@ -219,9 +219,7 @@ contract AgentPassportTest is Test {
     function test_SupportsInterface_ERC721_And_IIdentityRegistry() public view {
         assertTrue(registry.supportsInterface(0x80ac58cd), "must support ERC-721");
         assertTrue(registry.supportsInterface(0x5b5e139f), "must support ERC-721 Metadata");
-        assertTrue(
-            registry.supportsInterface(type(IIdentityRegistry).interfaceId), "must support IIdentityRegistry"
-        );
+        assertTrue(registry.supportsInterface(type(IIdentityRegistry).interfaceId), "must support IIdentityRegistry");
     }
 
     // U17
@@ -238,7 +236,8 @@ contract AgentPassportTest is Test {
         uint256 gasUsed = gasBefore - gasleft();
         // Sanity: registration actually happened (fails against the empty stub).
         assertEq(registry.ownerOf(id), alice);
-        // Budget pinned after first gas report; generous placeholder until then.
-        assertLt(gasUsed, 300_000, "register gas over budget");
+        // Budget pinned from R002 gas report (median ~101k for register(string)); headroom for
+        // short URIs. Guards against silent regression in downstream specs.
+        assertLt(gasUsed, 150_000, "register gas over budget");
     }
 }

@@ -46,10 +46,7 @@ contract AgentPassport is ERC721URIStorage, IIdentityRegistry {
     //////////////////////////////////////////////////////////////*/
 
     /// @inheritdoc IIdentityRegistry
-    function register(string calldata agentURI, MetadataEntry[] calldata metadata)
-        external
-        returns (uint256 agentId)
-    {
+    function register(string calldata agentURI, MetadataEntry[] calldata metadata) external returns (uint256 agentId) {
         agentId = _mintAgent(agentURI);
         for (uint256 i; i < metadata.length; ++i) {
             _writeMetadata(agentId, metadata[i].key, metadata[i].value);
