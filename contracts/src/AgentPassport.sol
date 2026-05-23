@@ -127,6 +127,7 @@ contract AgentPassport {
         if (bytes(name).length == 0 || bytes(endpoint).length == 0 || bytes(metadataURI).length == 0) {
             revert EmptyField();
         }
+        // slither-disable-next-line timestamp — false positive: this is an address comparison, not a timestamp comparison
         if (_agents[agentId].owner != address(0)) revert AlreadyRegistered(agentId);
 
         uint64 timestamp = uint64(block.timestamp);
@@ -219,6 +220,7 @@ contract AgentPassport {
     /// @notice Cheap existence check.
     /// @return True if `agentId` has been registered (and not relinquished).
     function exists(bytes32 agentId) external view returns (bool) {
+        // slither-disable-next-line timestamp — false positive: address comparison, not timestamp
         return _agents[agentId].owner != address(0);
     }
 }
