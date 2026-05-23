@@ -13,3 +13,4 @@ build/
 
 # Local AI context (not committed)
 CLAUDE.md
+.claude/
