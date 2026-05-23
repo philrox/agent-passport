@@ -18,18 +18,23 @@ contract AgentPassportTest is Test {
     address internal payment = makeAddr("payment");
     string internal constant URI = "ipfs://card-json";
 
-    // re-declared so we can use vm.expectEmit
+    // re-declared so we can use vm.expectEmit — must match contract byte-for-byte
     event AgentRegistered(
         bytes32 indexed agentId,
         address indexed owner,
+        address indexed paymentAddress,
         string name,
         string endpoint,
-        address paymentAddress,
         string metadataURI,
         uint64 registeredAt
     );
     event AgentUpdated(
-        bytes32 indexed agentId, string name, string endpoint, address paymentAddress, string metadataURI
+        bytes32 indexed agentId,
+        address indexed owner,
+        address indexed paymentAddress,
+        string name,
+        string endpoint,
+        string metadataURI
     );
     event AgentRelinquished(bytes32 indexed agentId, address indexed owner);
 
@@ -75,8 +80,9 @@ contract AgentPassportTest is Test {
 
     function test_RegisterAgent_EmitsAgentRegistered() public {
         vm.warp(1_700_000_000);
-        vm.expectEmit(true, true, false, true);
-        emit AgentRegistered(ID, alice, NAME, ENDPOINT, payment, URI, uint64(1_700_000_000));
+        // 3 indexed topics (agentId, owner, paymentAddress) + data check
+        vm.expectEmit(true, true, true, true);
+        emit AgentRegistered(ID, alice, payment, NAME, ENDPOINT, URI, uint64(1_700_000_000));
 
         vm.prank(alice);
         passport.registerAgent(ID, NAME, ENDPOINT, payment, URI);
@@ -130,8 +136,9 @@ contract AgentPassportTest is Test {
         passport.registerAgent(ID, NAME, ENDPOINT, payment, URI);
 
         address newPayment = makeAddr("newPayment");
-        vm.expectEmit(true, false, false, true);
-        emit AgentUpdated(ID, "vaia-ai-v2", "https://vaia.live/v2", newPayment, "ipfs://card-v2");
+        // 3 indexed topics (agentId, owner, paymentAddress) + data check
+        vm.expectEmit(true, true, true, true);
+        emit AgentUpdated(ID, alice, newPayment, "vaia-ai-v2", "https://vaia.live/v2", "ipfs://card-v2");
 
         vm.prank(alice);
         passport.updateAgent(ID, "vaia-ai-v2", "https://vaia.live/v2", newPayment, "ipfs://card-v2");
