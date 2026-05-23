@@ -9,6 +9,9 @@ import {IIdentityRegistry} from "./interfaces/IIdentityRegistry.sol";
 /// @notice STUB for TDD RED phase. Bodies intentionally empty so the suite compiles and
 ///         fails at runtime. Real implementation lands in the GREEN commit.
 contract AgentPassport is ERC721URIStorage, IIdentityRegistry {
+    /// @notice Thrown when a non-owner calls an owner-gated mutator.
+    error NotAgentOwner(uint256 agentId, address caller);
+
     constructor() ERC721("Agent Passport", "AGENT") {}
 
     function register(string calldata, MetadataEntry[] calldata) external returns (uint256 agentId) {}
