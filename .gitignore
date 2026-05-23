@@ -14,3 +14,9 @@ build/
 # Local AI context (not committed)
 CLAUDE.md
 .claude/
+
+# Internal dev specs + generated artifacts (not public docs).
+# Real documentation (the standard, integration guide) lives in docs/ root + README.
+docs/specs/
+docs/gas-reports/
+docs/storage-layouts/
