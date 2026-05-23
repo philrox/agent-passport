@@ -194,6 +194,14 @@ contract AgentPassportTest is Test {
     // FR6 (NEW): input validation — update rejects zero/empty
     // ====================================================================
 
+    function test_UpdateAgent_RevertsOnZeroAgentId() public {
+        // Zero is the reserved "unset" sentinel; updateAgent must reject it locally
+        // with ZeroAgentId rather than leaking the misleading UnknownAgent error.
+        vm.expectRevert(AgentPassport.ZeroAgentId.selector);
+        vm.prank(alice);
+        passport.updateAgent(bytes32(0), NAME, ENDPOINT, payment, URI);
+    }
+
     function test_UpdateAgent_RevertsOnZeroPaymentAddress() public {
         vm.prank(alice);
         passport.registerAgent(ID, NAME, ENDPOINT, payment, URI);
@@ -324,6 +332,13 @@ contract AgentPassportTest is Test {
         vm.expectRevert(abi.encodeWithSelector(AgentPassport.UnknownAgent.selector, unknown));
         vm.prank(alice);
         passport.relinquishAgent(unknown);
+    }
+
+    function test_RelinquishAgent_RevertsOnZeroAgentId() public {
+        // Zero sentinel rejected locally with ZeroAgentId, not UnknownAgent.
+        vm.expectRevert(AgentPassport.ZeroAgentId.selector);
+        vm.prank(alice);
+        passport.relinquishAgent(bytes32(0));
     }
 
     function test_RelinquishAgent_EmitsEvent() public {
