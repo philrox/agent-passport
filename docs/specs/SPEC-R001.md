@@ -1,15 +1,16 @@
 # SPEC-R001: AgentPassport — Skeleton & Storage Layout
 
-**Status:** 🟢 Done v2 (pending Phil-Review)
+**Status:** 🟢 Done v3 (pending Phil-Review)
 **Owner:** SA1 Contracts
 **Estimated:** 3h
-**Actual:** ~1h v1 + ~30min v2 hardening (code-review fixes)
+**Actual:** ~1h v1 + ~30min v2 hardening + ~15min v3 review-fixes
 **Dependencies:** —
 **Repo:** agent-passport
 **Created:** 2026-05-23
 **Revisions:**
 - v1 (2026-05-23 12:18) — initial 13-test green
 - v2 (2026-05-23 12:45) — hardened per `/code-review` — see `## Changelog v2` at bottom
+- v3 (2026-05-23) — PR #2 review-fixes (ZeroAgentId guard, relinquish SLOAD, docs) — see `## Changelog v3`
 
 ## Context
 
@@ -52,7 +53,9 @@ Das Ziel ist ein **minimaler, permissionless Registry-Contract**, der pro `bytes
   - `UnknownAgent(bytes32 agentId)`
   - **v2:** `ZeroAgentId()`, `ZeroPaymentAddress()`, `EmptyField()`, `NoChange(bytes32 agentId)`
 - **FR6 (v2):** `registerAgent` und `updateAgent` validieren Inputs:
-  - `agentId != bytes32(0)` (register) — reserviert Null als Sentinel für Downstream-Consumer
+  - `agentId != bytes32(0)` (register, update, relinquish — v3) — reserviert Null als Sentinel für
+    Downstream-Consumer. Lokaler `ZeroAgentId`-Guard an jedem mutierenden Entrypoint statt impliziter
+    `UnknownAgent`-Antwort, damit SDK-Caller mit Default-`bytes32` einen eindeutigen Fehler bekommen.
   - `paymentAddress != address(0)` (beide) — verhindert Burn durch SDK-Defaults
   - `name`, `endpoint`, `metadataURI` non-empty (beide) — verhindert versehentliches Wipe
 - **FR7 (v2):** `updateAgent` revertet mit `NoChange(agentId)` wenn alle vier mutierbaren Felder
@@ -62,7 +65,7 @@ Das Ziel ist ein **minimaler, permissionless Registry-Contract**, der pro `bytes
   - `exists(bytes32) returns (bool)` — True wenn registriert (und nicht relinquished)
   - Beide ~2.5k gas vs ~20k für `resolveAgent().owner` (8× cheaper)
 - **FR9 (v2):** `relinquishAgent(bytes32)` — Owner kann ID surrendern.
-  - Nur Owner; revertet `NotOwner` für andere und `UnknownAgent` für nicht-registrierte
+  - Nur Owner; revertet `ZeroAgentId` für Null-ID (v3), `NotOwner` für andere und `UnknownAgent` für nicht-registrierte
   - `delete _agents[id]` + `emit AgentRelinquished(id, owner)`
   - Slot wird leer; ID ist sofort wieder registrierbar (auch durch denselben Owner mit fresh key — Key-Compromise-Recovery)
 
@@ -84,9 +87,9 @@ Das Ziel ist ein **minimaler, permissionless Registry-Contract**, der pro `bytes
 
 ## Acceptance Tests (written FIRST, must FAIL before implementation)
 
-**39 Tests total** = 32 Unit + 4 Scenarios + 3 Inheritance.
+**41 Tests total** = 34 Unit + 4 Scenarios + 3 Inheritance.
 
-### Unit Tests — `contracts/test/AgentPassport.t.sol` (32 Tests)
+### Unit Tests — `contracts/test/AgentPassport.t.sol` (34 Tests)
 
 | # | Name | Deckt |
 |---|---|---|
@@ -122,6 +125,8 @@ Das Ziel ist ein **minimaler, permissionless Registry-Contract**, der pro `bytes
 | U30 | `test_RelinquishAgent_AllowsReRegistration` (v2) | FR9 |
 | U31 | `test_RegisterAgent_GasUnder250k` (v2) | NFR1 |
 | U32 | `test_StorageLayout_AgentCard_SlotMap` (v2) | NFR2 |
+| U33 | `test_UpdateAgent_RevertsOnZeroAgentId` (v3) | FR6, ZeroAgentId |
+| U34 | `test_RelinquishAgent_RevertsOnZeroAgentId` (v3) | FR6/FR9, ZeroAgentId |
 
 ### Functional Tests — `contracts/test/AgentPassport.scenarios.t.sol` (4 Tests)
 
@@ -189,6 +194,19 @@ Das Ziel ist ein **minimaler, permissionless Registry-Contract**, der pro `bytes
 - Slither static-analysis Run → **R014** (CI-Pipeline)
 - Deployment auf Arc-Testnet → Phil-Manual nach R007 fertig
 - Optimistic Concurrency Token für update (relevant erst nach R002 NFT-Transfer enables ownership change mid-block) → R002 design
+- **Namespace-Squatting-Schutz** — bewusst KEIN. Die Registry ist permissionless;
+  `agentId` ist caller-chosen, first-come-first-served. Jeder kann z.B.
+  `keccak256("openai-gpt-4")` zuerst claimen. Eine Naming-Authority / Allowlist /
+  Stake-to-claim wäre eine eigene Spec — out of scope für das Skeleton. Konsumenten
+  dürfen sich NICHT auf "ID ⇒ legitimer Betreiber" verlassen; Vertrauen kommt über
+  Reputation (R010) und Off-Chain-Attestation, nicht über ID-Besitz.
+- **Key-Compromise Re-Register-Race** — `relinquishAgent` ermöglicht Recovery
+  (kompromittierter Key relinquished, frischer Key re-registriert), aber schützt
+  NICHT gegen einen Angreifer, der die relinquish-Transaktion im Mempool sieht und
+  die Re-Registrierung frontrunnt. Im Compromise-Szenario ist das kein neuer
+  Verlust (der Angreifer kontrolliert bereits den Key), aber es verhindert *keine*
+  feindliche Übernahme der ID. Echte atomare Owner-Rotation kommt mit R002
+  (NFT-Transfer) — bis dahin ist relinquish ein Best-Effort-Recovery, kein Guarantee.
 
 ## Definition of Done
 
@@ -196,7 +214,7 @@ Das Ziel ist ein **minimaler, permissionless Registry-Contract**, der pro `bytes
 - [x] Failing Unit-Tests committed (eigener Commit, 8/9 RED + 1 trivial-PASS)
 - [x] Failing Functional-Tests committed (eigener Commit, 4 RED)
 - [x] Implementation committed, alle 13 Tests grün (`forge test`)
-- [x] `forge coverage` 100% für `AgentPassport.sol` (>80% Schwelle) — v2: 100% (38/38 lines, 11/11 branches)
+- [x] `forge coverage` 100% für `AgentPassport.sol` (>80% Schwelle) — v3: 100% (38/38 lines, 13/13 branches)
 - [x] `forge test --gas-report` archiviert in `docs/gas-reports/R001.md`
 - [x] `registerAgent`-Gas Median 188k bestätigt (<250k) — v2: in-Test pinned via U31
 - [x] `forge fmt --check` exitet 0
@@ -228,6 +246,31 @@ Das Ziel ist ein **minimaler, permissionless Registry-Contract**, der pro `bytes
 - 2026-05-23 12:35 — RED: 22 new tests + fuzz hardening + stubs (commit `00a8599`) — 17/36 fail
 - 2026-05-23 12:42 — GREEN: contract hardening (commit `60d038c`) — 39/39 grün, coverage 100%
 - 2026-05-23 12:50 — docs: Spec-Card v2 + DoD update (this commit)
+
+### v3 — second-pass review fixes (PR #2 review, 3 issues actioned)
+- 2026-05-23 — RED: 2 ZeroAgentId tests on update + relinquish (commit `f187796`) — 2/3 fail (UnknownAgent != ZeroAgentId)
+- 2026-05-23 — GREEN: ZeroAgentId guard on update + relinquish (commit `1a5b4db`) — 41/41 grün
+- 2026-05-23 — REFACTOR: dropped redundant SLOAD in relinquishAgent (commit `502b6aa`) — stays grün
+- 2026-05-23 — docs: Spec-Card v3 + gas-report v3 + Out-of-Scope notes (this commit)
+
+## Changelog v3
+
+Drivers: PR #2 second-pass review. 3 issues actioned, 1 dropped as non-issue.
+
+**Contract:**
+- Explicit `ZeroAgentId` guard added to `updateAgent` + `relinquishAgent` (was implicit `UnknownAgent`) — review issue #3
+- `relinquishAgent`: dropped redundant `card.owner` SLOAD, emit `msg.sender` (proven equal) — review issue #1
+
+**Tests (41 total, +2 from v2):**
+- `test_UpdateAgent_RevertsOnZeroAgentId` (U33), `test_RelinquishAgent_RevertsOnZeroAgentId` (U34)
+- Branch coverage 11/11 → 13/13 (two new guard branches)
+
+**Docs:**
+- Out of Scope: namespace-squatting (permissionless, no naming authority) + key-compromise re-register race — review issues #4, #5
+- Gas-report v3 deltas
+
+**Dropped (non-issue):**
+- NoChange hash-compare "unbounded string cost" (review issue #2) — the `&&` already short-circuits on `paymentAddress` first, so strings are only hashed when payment matches. No change needed.
 
 ## Changelog v2
 
