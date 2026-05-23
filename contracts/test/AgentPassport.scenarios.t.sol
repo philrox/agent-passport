@@ -109,13 +109,15 @@ contract AgentPassportScenariosTest is Test {
         address paymentAddress,
         string calldata metadataURI
     ) public {
-        // Filter assumptions: non-zero registrant, distinct attacker, bounded strings
-        vm.assume(registrant != address(0));
-        vm.assume(attacker != address(0));
+        // Filter: contract invariants (non-zero, non-empty, valid VM senders)
+        vm.assume(id != bytes32(0));
+        vm.assume(registrant != address(0) && registrant != address(this) && registrant != address(passport));
+        vm.assume(attacker != address(0) && attacker != address(this) && attacker != address(passport));
         vm.assume(attacker != registrant);
-        vm.assume(bytes(name).length <= 64);
-        vm.assume(bytes(endpoint).length <= 128);
-        vm.assume(bytes(metadataURI).length <= 128);
+        vm.assume(paymentAddress != address(0));
+        vm.assume(bytes(name).length > 0 && bytes(name).length <= 64);
+        vm.assume(bytes(endpoint).length > 0 && bytes(endpoint).length <= 128);
+        vm.assume(bytes(metadataURI).length > 0 && bytes(metadataURI).length <= 128);
 
         vm.prank(registrant);
         passport.registerAgent(id, name, endpoint, paymentAddress, metadataURI);
@@ -127,9 +129,11 @@ contract AgentPassportScenariosTest is Test {
         assertEq(card.paymentAddress, paymentAddress, "payment roundtrips");
         assertEq(card.metadataURI, metadataURI, "uri roundtrips");
 
-        // attacker cannot update
+        // attacker cannot update (uses different payment to bypass NoChange path)
+        address attackerPayment = address(uint160(paymentAddress) ^ 0xdead);
+        if (attackerPayment == address(0)) attackerPayment = address(0xBEEF);
         vm.expectRevert(abi.encodeWithSelector(AgentPassport.NotOwner.selector, id, attacker));
         vm.prank(attacker);
-        passport.updateAgent(id, "hack", "evil", attacker, "evil-uri");
+        passport.updateAgent(id, "hack-name", "evil-endpoint", attackerPayment, "evil-uri");
     }
 }

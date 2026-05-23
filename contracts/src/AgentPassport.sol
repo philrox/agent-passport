@@ -40,11 +40,28 @@ contract AgentPassport {
     /// @notice Thrown when registerAgent is called with an already-used agentId.
     error AlreadyRegistered(bytes32 agentId);
 
-    /// @notice Thrown when updateAgent is called by a non-owner.
+    /// @notice Thrown when updateAgent / relinquishAgent is called by a non-owner.
     error NotOwner(bytes32 agentId, address caller);
 
-    /// @notice Thrown when updateAgent is called for an unregistered agentId.
+    /// @notice Thrown when updateAgent / relinquishAgent targets an unregistered agentId.
     error UnknownAgent(bytes32 agentId);
+
+    /// @notice Thrown when registerAgent is called with `agentId == bytes32(0)`.
+    /// @dev Reserves zero as an unambiguous "unset" sentinel for downstream consumers
+    ///      (R003 JobContract default-initialized `bytes32 providerAgentId` etc.).
+    error ZeroAgentId();
+
+    /// @notice Thrown when register/update is called with `paymentAddress == address(0)`.
+    /// @dev Prevents accidental fund-burn via SDK helpers that forget the field.
+    error ZeroPaymentAddress();
+
+    /// @notice Thrown when register/update is called with an empty `name`, `endpoint`,
+    ///         or `metadataURI`. Prevents accidental wipe by half-populated SDK calls.
+    error EmptyField();
+
+    /// @notice Thrown when updateAgent is called with values identical to the stored card.
+    ///         Forces callers to dedupe client-side and keeps event streams clean.
+    error NoChange(bytes32 agentId);
 
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
@@ -65,6 +82,11 @@ contract AgentPassport {
     event AgentUpdated(
         bytes32 indexed agentId, string name, string endpoint, address paymentAddress, string metadataURI
     );
+
+    /// @notice Emitted when an owner surrenders an agentId. After emission the slot
+    ///         is empty and re-registerable by anyone (including a fresh key the
+    ///         original owner now controls — useful for key-rotation/compromise flows).
+    event AgentRelinquished(bytes32 indexed agentId, address indexed owner);
 
     /*//////////////////////////////////////////////////////////////
                             EXTERNAL WRITES
@@ -135,4 +157,22 @@ contract AgentPassport {
     function resolveAgent(bytes32 agentId) external view returns (AgentCard memory card) {
         return _agents[agentId];
     }
+
+    // -------------------------------------------------------------------------
+    // RED STUBS — real implementations land in the GREEN commit.
+    // Empty bodies make new tests compile and fail at runtime (not compile-time).
+    // -------------------------------------------------------------------------
+
+    /// @notice Cheap owner lookup (stub).
+    function agentOwner(bytes32) external pure returns (address) {
+        return address(0);
+    }
+
+    /// @notice Cheap existence check (stub).
+    function exists(bytes32) external pure returns (bool) {
+        return false;
+    }
+
+    /// @notice Surrender an agentId (stub).
+    function relinquishAgent(bytes32) external pure {}
 }
