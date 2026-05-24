@@ -14,6 +14,7 @@ contract AgentPassportTest is Test {
 
     address internal alice = makeAddr("alice");
     address internal bob = makeAddr("bob");
+    address internal carol = makeAddr("carol");
 
     string internal constant URI1 = "ipfs://card-alice";
     string internal constant URI2 = "ipfs://card-alice-v2";
@@ -222,6 +223,74 @@ contract AgentPassportTest is Test {
         vm.prank(bob);
         registry.setAgentURI(id, URI2);
         assertEq(registry.tokenURI(id), URI2);
+    }
+
+    // U38: transfer resets ALL generic metadata — the new owner inherits a blank slate, never
+    // the previous owner's (potentially stale/misleading) capability/venue claims.
+    function test_Transfer_ClearsAllMetadata() public {
+        IIdentityRegistry.MetadataEntry[] memory entries = new IIdentityRegistry.MetadataEntry[](2);
+        entries[0] = IIdentityRegistry.MetadataEntry({key: "capability", value: bytes("trading")});
+        entries[1] = IIdentityRegistry.MetadataEntry({key: "venue", value: bytes("polymarket")});
+        vm.prank(alice);
+        uint256 id = registry.register(URI1, entries);
+        // Pin pre-transfer state so the post-transfer assert isn't vacuous.
+        assertEq(registry.getMetadata(id, "capability"), bytes("trading"), "metadata set before transfer");
+
+        vm.prank(alice);
+        registry.transferFrom(alice, bob, id);
+
+        assertEq(registry.getMetadata(id, "capability"), bytes(""), "capability must clear on transfer");
+        assertEq(registry.getMetadata(id, "venue"), bytes(""), "venue must clear on transfer");
+        // URI is identity-level and intentionally survives (see test_Scenario_RegisterTransferResolve).
+        assertEq(registry.tokenURI(id), URI1, "URI must survive transfer");
+    }
+
+    // U39: burn resets ALL generic metadata too (no stale reads against a retired id).
+    function test_Burn_ClearsAllMetadata() public {
+        vm.prank(alice);
+        uint256 id = registry.register(URI1);
+        vm.prank(alice);
+        registry.setMetadata(id, "capability", bytes("trading"));
+
+        vm.prank(alice);
+        registry.burn(id);
+
+        assertEq(registry.getMetadata(id, "capability"), bytes(""), "metadata must clear on burn");
+    }
+
+    // U40: the reset is per-ownership, not one-shot. After a transfer clears alice's metadata, bob's
+    // freshly written metadata must ALSO clear on the next transfer (catches stale key-tracking).
+    function test_Transfer_NewOwnerMetadataClearsOnSubsequentTransfer() public {
+        vm.prank(alice);
+        uint256 id = registry.register(URI1);
+        vm.prank(alice);
+        registry.setMetadata(id, "capability", bytes("trading"));
+
+        vm.prank(alice);
+        registry.transferFrom(alice, bob, id);
+        assertEq(registry.getMetadata(id, "capability"), bytes(""), "alice's metadata cleared");
+
+        // Bob populates fresh metadata, then hands off to carol.
+        vm.prank(bob);
+        registry.setMetadata(id, "capability", bytes("oracle"));
+        assertEq(registry.getMetadata(id, "capability"), bytes("oracle"), "bob's metadata readable");
+        vm.prank(bob);
+        registry.transferFrom(bob, carol, id);
+
+        assertEq(registry.getMetadata(id, "capability"), bytes(""), "bob's metadata must clear for carol");
+    }
+
+    // U41: a self-transfer (from == to) is a no-op handover and must NOT wipe metadata.
+    function test_SelfTransfer_PreservesMetadata() public {
+        vm.prank(alice);
+        uint256 id = registry.register(URI1);
+        vm.prank(alice);
+        registry.setMetadata(id, "capability", bytes("trading"));
+
+        vm.prank(alice);
+        registry.transferFrom(alice, alice, id);
+
+        assertEq(registry.getMetadata(id, "capability"), bytes("trading"), "self-transfer must preserve metadata");
     }
 
     /*//////////////////////////////////////////////////////////////
