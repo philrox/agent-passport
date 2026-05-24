@@ -77,7 +77,15 @@ class IdentityRegistry:
     def list_registered(
         self, from_block: "BlockIdentifier" = 0, to_block: "BlockIdentifier" = "latest"
     ) -> list[RegisteredAgent]:
-        raise NotImplementedError
+        logs = self._contract.events.Registered().get_logs(from_block=from_block, to_block=to_block)
+        return [
+            RegisteredAgent(
+                agent_id=int(log["args"]["agentId"]),
+                owner=to_checksum_address(log["args"]["owner"]),
+                agent_uri=log["args"]["agentURI"],
+            )
+            for log in logs
+        ]
 
     # ----------------------------------------------------------------- writes
     def register(
