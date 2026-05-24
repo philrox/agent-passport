@@ -251,6 +251,8 @@ contract AgentPassportTest is Test {
         uint256 id = registry.register(URI1);
         vm.prank(alice);
         registry.setMetadata(id, "capability", bytes("trading"));
+        // Pin pre-burn state so the post-burn assert isn't vacuous.
+        assertEq(registry.getMetadata(id, "capability"), bytes("trading"), "metadata set before burn");
 
         vm.prank(alice);
         registry.burn(id);
@@ -291,6 +293,28 @@ contract AgentPassportTest is Test {
         registry.transferFrom(alice, alice, id);
 
         assertEq(registry.getMetadata(id, "capability"), bytes("trading"), "self-transfer must preserve metadata");
+    }
+
+    // U42: the agent wallet (security-relevant) also resets per-ownership — a wallet set by an
+    // intermediate owner must NOT survive the next transfer (mirrors U40 for the reserved key).
+    function test_Transfer_AgentWalletClearsOnSubsequentTransfer() public {
+        vm.prank(alice);
+        uint256 id = registry.register(URI1);
+        vm.prank(alice);
+        registry.transferFrom(alice, bob, id);
+
+        // Bob authorizes a fresh wallet, then hands off to carol.
+        (address wallet, uint256 walletPk) = makeAddrAndKey("bobWallet");
+        uint256 deadline = block.timestamp + 60;
+        bytes memory sig = _signWallet(id, wallet, bob, deadline, walletPk);
+        vm.prank(bob);
+        registry.setAgentWallet(id, wallet, deadline, sig);
+        assertEq(registry.getAgentWallet(id), wallet, "bob's wallet readable before handoff");
+
+        vm.prank(bob);
+        registry.transferFrom(bob, carol, id);
+
+        assertEq(registry.getAgentWallet(id), address(0), "bob's wallet must clear for carol");
     }
 
     /*//////////////////////////////////////////////////////////////
