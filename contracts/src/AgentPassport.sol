@@ -144,11 +144,9 @@ contract AgentPassport is ERC721, ERC721URIStorage, ERC721Burnable, EIP712, IIde
         // Deadline comparison is intentional (a ~5-min signature window); sub-second validator
         // timestamp drift is immaterial. Suppress both linters' timestamp heuristics.
         // slither-disable-next-line timestamp
-        // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp > deadline) revert SignatureExpired(deadline);
+        if (block.timestamp > deadline) revert SignatureExpired(deadline); // forge-lint: disable-line(block-timestamp)
         // slither-disable-next-line timestamp
-        // forge-lint: disable-next-line(block-timestamp)
-        if (deadline > block.timestamp + MAX_WALLET_SIG_DELAY) revert DeadlineTooFar(deadline);
+        if (deadline > block.timestamp + MAX_WALLET_SIG_DELAY) revert DeadlineTooFar(deadline); // forge-lint: disable-line(block-timestamp)
 
         bytes32 structHash = keccak256(abi.encode(AGENT_WALLET_SET_TYPEHASH, agentId, newWallet, owner, deadline));
         bytes32 digest = _hashTypedDataV4(structHash);
