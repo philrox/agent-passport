@@ -53,10 +53,20 @@ contract AgentPassport is ERC721, ERC721URIStorage, ERC721Burnable, EIP712, IIde
     ///      "unregistered" sentinel for downstream consumers (R003/R004/SDKs).
     uint256 private _nextAgentId = 1;
 
-    /// @dev agentId => keccak256(key) => raw value. Key hashed for storage; the plaintext key
-    ///      is preserved in the {MetadataSet} event. The agent wallet lives here too, under
-    ///      {RESERVED_AGENT_WALLET_KEY_HASH} as `abi.encodePacked(address)` (20 bytes).
+    /// @dev agentId => storage-slot => raw value. The slot is {_metadataSlot} =
+    ///      keccak256(epoch, keccak256(key)) — i.e. the metadata is namespaced by the agent's
+    ///      current {_metadataEpoch}, so a single epoch bump on transfer/burn orphans EVERY key
+    ///      (generic metadata + the reserved agent wallet) in O(1) without an unbounded delete
+    ///      loop. The plaintext key is preserved in the {MetadataSet} event. The agent wallet
+    ///      lives here under {RESERVED_AGENT_WALLET_KEY_HASH} as `abi.encodePacked(address)`.
     mapping(uint256 => mapping(bytes32 => bytes)) private _metadata;
+
+    /// @dev agentId => current metadata epoch. Incremented on every ownership change (transfer)
+    ///      and on burn, which re-namespaces all of an agent's metadata and thereby resets it to
+    ///      empty for the new owner. A new owner never inherits the previous owner's metadata
+    ///      (capability/venue claims, agent wallet). Old values are not zeroed (no gas refund);
+    ///      they simply become unreachable. Starts at 0; reads/writes use the live epoch.
+    mapping(uint256 => uint256) private _metadataEpoch;
 
     /*//////////////////////////////////////////////////////////////
                                 ERRORS
@@ -157,14 +167,14 @@ contract AgentPassport is ERC721, ERC721URIStorage, ERC721Burnable, EIP712, IIde
 
     /// @inheritdoc IIdentityRegistry
     function getMetadata(uint256 agentId, string calldata key) external view returns (bytes memory) {
-        return _metadata[agentId][keccak256(bytes(key))];
+        return _metadata[agentId][_metadataSlot(agentId, keccak256(bytes(key)))];
     }
 
     /// @inheritdoc IIdentityRegistry
     /// @dev Note: reads the reserved "agentWallet" metadata slot and decodes the 20 packed bytes.
     ///      Returns address(0) for an unset wallet OR an unregistered/burned agentId (no revert).
     function getAgentWallet(uint256 agentId) external view returns (address) {
-        bytes memory packed = _metadata[agentId][RESERVED_AGENT_WALLET_KEY_HASH];
+        bytes memory packed = _metadata[agentId][_metadataSlot(agentId, RESERVED_AGENT_WALLET_KEY_HASH)];
         // forge-lint: disable-next-line(unsafe-typecast) — slot only ever holds 20 packed bytes via _storeAndEmitWallet
         return packed.length == 20 ? address(bytes20(packed)) : address(0);
     }
@@ -211,7 +221,7 @@ contract AgentPassport is ERC721, ERC721URIStorage, ERC721Burnable, EIP712, IIde
     ///      every wallet change — including the register-time default — is observable off-chain.
     function _storeAndEmitWallet(uint256 agentId, address wallet) private {
         bytes memory packed = wallet == address(0) ? bytes("") : abi.encodePacked(wallet);
-        _metadata[agentId][RESERVED_AGENT_WALLET_KEY_HASH] = packed;
+        _metadata[agentId][_metadataSlot(agentId, RESERVED_AGENT_WALLET_KEY_HASH)] = packed;
         emit MetadataSet(agentId, "agentWallet", "agentWallet", packed);
     }
 
@@ -220,8 +230,16 @@ contract AgentPassport is ERC721, ERC721URIStorage, ERC721Burnable, EIP712, IIde
     function _writeMetadata(uint256 agentId, string calldata key, bytes calldata value) private {
         bytes32 keyHash = keccak256(bytes(key));
         if (keyHash == RESERVED_AGENT_WALLET_KEY_HASH) revert ReservedMetadataKey();
-        _metadata[agentId][keyHash] = value;
+        _metadata[agentId][_metadataSlot(agentId, keyHash)] = value;
         emit MetadataSet(agentId, key, key, value);
+    }
+
+    /// @dev Epoch-namespaced storage slot for an agent's metadata key. Mixing the agent's current
+    ///      {_metadataEpoch} into the slot means a single `++epoch` (on transfer/burn) atomically
+    ///      orphans every key without iterating them — avoiding an unbounded delete loop that an
+    ///      agent could grief into a permanently non-transferable token.
+    function _metadataSlot(uint256 agentId, bytes32 keyHash) private view returns (bytes32) {
+        return keccak256(abi.encode(_metadataEpoch[agentId], keyHash));
     }
 
     /// @dev Revert unless the caller owns `agentId`. `ownerOf` reverts for unregistered ids.
@@ -229,12 +247,17 @@ contract AgentPassport is ERC721, ERC721URIStorage, ERC721Burnable, EIP712, IIde
         if (ownerOf(agentId) != msg.sender) revert NotAgentOwner(agentId, msg.sender);
     }
 
-    /// @dev Clear the verified agent wallet on transfer/burn so it never persists to a new owner
-    ///      (the new owner must re-run {setAgentWallet}). No-op on mint (`from == 0`).
+    /// @dev On a real ownership change (transfer) or burn, bump the agent's metadata epoch. This
+    ///      resets ALL metadata — generic keys AND the verified agent wallet — so nothing persists
+    ///      to a new owner: capability/venue claims become empty and the wallet must be re-set via
+    ///      {setAgentWallet}. O(1): no per-key delete loop (which an agent could grief into an
+    ///      untransferable token). No-op on mint (`from == 0`) and self-transfer (`from == to`).
     function _update(address to, uint256 tokenId, address auth) internal override(ERC721) returns (address from) {
         from = super._update(to, tokenId, auth);
         if (from != address(0) && from != to) {
-            delete _metadata[tokenId][RESERVED_AGENT_WALLET_KEY_HASH];
+            unchecked {
+                ++_metadataEpoch[tokenId];
+            }
         }
     }
 }
