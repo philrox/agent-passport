@@ -385,6 +385,22 @@ contract AgentPassportTest is Test {
         registry.setMetadata(id, "agentWallet", abi.encodePacked(bob));
     }
 
+    // U26b: a reserved key in register()'s metadata batch reverts the WHOLE registration (no orphan
+    // mint, _nextAgentId rolls back — the next register still gets id 1).
+    function test_RegisterWithMetadata_RevertsOnReservedKey() public {
+        IIdentityRegistry.MetadataEntry[] memory entries = new IIdentityRegistry.MetadataEntry[](1);
+        entries[0] = IIdentityRegistry.MetadataEntry({key: "agentWallet", value: abi.encodePacked(bob)});
+
+        vm.expectRevert(AgentPassport.ReservedMetadataKey.selector);
+        vm.prank(alice);
+        registry.register(URI1, entries);
+
+        // Rollback proof: no token minted, id counter unchanged.
+        assertFalse(registry.exists(1), "reverted registration must not mint");
+        vm.prank(bob);
+        assertEq(registry.register(URI1), 1, "id counter must have rolled back");
+    }
+
     // U29: ERC-1271 wallet that REJECTS the signature -> InvalidWalletSignature (reject path).
     function test_SetAgentWallet_ERC1271_RejectingWallet_Reverts() public {
         vm.prank(alice);
