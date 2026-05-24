@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from eth_utils import to_checksum_address
+from eth_utils.address import to_checksum_address
 from web3.exceptions import ContractLogicError
 from web3.logs import DISCARD
 
@@ -149,7 +149,9 @@ class IdentityRegistry:
             )
         except ContractLogicError as exc:
             _map_revert(exc)
-        signed = account.sign_transaction(tx)
+        # web3's TxParams TypedDict and eth_account's expected transaction dict are
+        # structurally compatible at runtime; their stubs just don't agree.
+        signed = account.sign_transaction(tx)  # type: ignore[arg-type]
         tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
         receipt = self._w3.eth.wait_for_transaction_receipt(tx_hash)
         if receipt["status"] != 1:

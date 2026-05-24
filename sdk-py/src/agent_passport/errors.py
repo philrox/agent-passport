@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from typing import NoReturn
 
-from eth_abi import decode as abi_decode
-from eth_utils import function_signature_to_4byte_selector, to_checksum_address
+from eth_abi.abi import decode as abi_decode
+from eth_utils.abi import function_signature_to_4byte_selector
+from eth_utils.address import to_checksum_address
 
 __all__ = [
     "AgentPassportError",

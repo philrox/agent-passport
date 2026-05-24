@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from eth_utils import to_checksum_address
+from eth_utils.address import to_checksum_address
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
 __all__ = ["Address", "MetadataEntry", "RegisteredAgent", "AgentIdentity"]

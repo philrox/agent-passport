@@ -17,7 +17,7 @@ from typing import Any
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 from eth_account.signers.local import LocalAccount
-from eth_utils import to_checksum_address
+from eth_utils.address import to_checksum_address
 
 # Contract constant: MAX_WALLET_SIG_DELAY. The deadline must be in the future AND
 # within this window of `now`. We default below it to leave clock-skew headroom.
