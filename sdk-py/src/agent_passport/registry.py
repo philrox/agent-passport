@@ -116,10 +116,15 @@ class IdentityRegistry:
         return self._w3.to_hex(receipt["transactionHash"])
 
     def set_agent_wallet(self, agent_id: int, new_wallet: str, signature: bytes, deadline: int) -> str:
-        raise NotImplementedError
+        call = self._contract.functions.setAgentWallet(
+            agent_id, to_checksum_address(new_wallet), deadline, signature
+        )
+        receipt = self._send(call)
+        return self._w3.to_hex(receipt["transactionHash"])
 
     def unset_agent_wallet(self, agent_id: int) -> str:
-        raise NotImplementedError
+        receipt = self._send(self._contract.functions.unsetAgentWallet(agent_id))
+        return self._w3.to_hex(receipt["transactionHash"])
 
     # --------------------------------------------------------------- internal
     def _require_account(self) -> "LocalAccount":
