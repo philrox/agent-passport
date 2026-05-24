@@ -54,8 +54,10 @@ interface IIdentityRegistry {
     function getMetadata(uint256 agentId, string calldata key) external view returns (bytes memory);
 
     /// @notice Set the agent's wallet (payment/operator address, distinct from the NFT owner).
-    /// @dev R002 deviation: owner-gated; `deadline`/`signature` are accepted but NOT verified.
-    ///      The EIP-712 signature-delegation path is a documented follow-up (see SPEC-R002).
+    /// @dev Caller must own `agentId`. `newWallet` authorizes the assignment with an EIP-712
+    ///      signature (EOA) or ERC-1271 (smart-contract wallet) over
+    ///      `AgentWalletSet(uint256 agentId,address newWallet,address owner,uint256 deadline)`.
+    ///      `deadline` must be in the future and within 5 minutes (replay window).
     function setAgentWallet(uint256 agentId, address newWallet, uint256 deadline, bytes calldata signature) external;
 
     /// @notice Read the agent's wallet. Returns address(0) if unset.
