@@ -1,229 +1,263 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-/// @title AgentPassport — Cross-Venue Agent Identity Registry (Skeleton, R001)
+import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+import {ERC721URIStorage} from "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
+import {ERC721Burnable} from "@openzeppelin/contracts/token/ERC721/extensions/ERC721Burnable.sol";
+import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
+import {IIdentityRegistry} from "./interfaces/IIdentityRegistry.sol";
+
+/// @title AgentPassport — ERC-8004 Identity Registry
 /// @author VAIA team
-/// @notice Permissionless registry mapping `bytes32` agent IDs to AgentCards.
-///         Anyone can register a new agentId; only the registering address can update
-///         or relinquish it. Reads never revert — unknown IDs return an empty struct.
-/// @dev R002 (ERC-8004 compliance) inherits this contract. Two invariants the
-///      subclass MUST preserve:
-///        1. `_agents` mapping stays at storage slot 0 — add new state AFTER it.
-///        2. Inheritance order is `is AgentPassport, ERC721` (NOT the reverse) so
-///           AgentPassport's storage is laid down first. Reversing the order would
-///           shift `_agents` to a different slot and corrupt every existing record.
-contract AgentPassport {
+/// @notice Cross-venue agent identity as an ERC-721. Each agent is a token whose `tokenId`
+///         is its `agentId` (uint256, auto-incremented from 1; 0 is reserved as the
+///         "unregistered" sentinel). `tokenURI(agentId)` points to the off-chain Agent Card
+///         JSON (name, capabilities, endpoints). Registration is permissionless; owner-gated
+///         mutators evolve URI/metadata, ERC-721 transfer hands over the identity, and the owner
+///         can retire it via {burn} (ERC721Burnable). On transfer/burn all metadata (capabilities,
+///         venue claims, agent wallet) is reset — only the `tokenURI` (the identity pointer)
+///         survives; a new owner starts from a clean slate. See {_update}.
+/// @dev Implements {IIdentityRegistry} (ERC-8004 Identity Registry surface) on top of OZ
+///      ERC-721 + URIStorage + Burnable. The agent wallet is set with a signature from the wallet
+///      itself (EIP-712 for EOAs, ERC-1271 for smart-contract wallets), matching the canonical
+///      erc-8004/erc-8004-contracts implementation. Reputation Registry → R010, Validation
+///      Registry → R004. Reference: https://eips.ethereum.org/EIPS/eip-8004
+///
+///      Retire/recovery: {burn} retires an identity (ids never recycle; recover by burning and
+///      registering a fresh id, then re-pointing off-chain references). This does NOT defend
+///      against a compromised owner key — whoever holds the key controls (and can burn) the
+///      identity; key-rotation is out of scope, consistent with NFT-based identity in general.
+contract AgentPassport is ERC721, ERC721URIStorage, ERC721Burnable, EIP712, IIdentityRegistry {
+    /*//////////////////////////////////////////////////////////////
+                                CONSTANTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev EIP-712 type hash for an agent-wallet authorization. `owner` is injected by the
+    ///      contract (= current NFT owner), binding the signature to that owner so a pre-signed
+    ///      approval cannot be replayed after the agent NFT changes hands. No nonce: replay is
+    ///      bounded by the owner binding plus the short {MAX_WALLET_SIG_DELAY} deadline window.
+    bytes32 private constant AGENT_WALLET_SET_TYPEHASH =
+        keccak256("AgentWalletSet(uint256 agentId,address newWallet,address owner,uint256 deadline)");
+
+    /// @dev Maximum forward window for a wallet-set signature's deadline (nonce replacement).
+    uint256 private constant MAX_WALLET_SIG_DELAY = 5 minutes;
+
+    /// @dev Reserved metadata key under which the agent wallet is stored. Protected from
+    ///      generic {setMetadata} writes so the typed accessors stay the single source of truth.
+    bytes32 private constant RESERVED_AGENT_WALLET_KEY_HASH = keccak256(bytes("agentWallet"));
+
     /*//////////////////////////////////////////////////////////////
                                 STORAGE
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice On-chain record for a registered agent.
-    /// @dev Per-entry storage slot map (relative to the value's keccak-derived root):
-    ///        slot 0: `owner` (low 160 bits) + `registeredAt` (next 64 bits), packed
-    ///        slot 1: `name`           (string)
-    ///        slot 2: `endpoint`       (string)
-    ///        slot 3: `paymentAddress` (address — own slot, bracketed by strings)
-    ///        slot 4: `metadataURI`    (string)
-    ///      Pinned by `test_StorageLayout_AgentCard_SlotMap`. New fields MUST be
-    ///      appended after `metadataURI`; never insert mid-struct.
-    struct AgentCard {
-        address owner;
-        uint64 registeredAt;
-        string name;
-        string endpoint;
-        address paymentAddress;
-        string metadataURI;
-    }
+    /// @dev Next agentId to assign. Starts at 1 so that 0 stays an unambiguous
+    ///      "unregistered" sentinel for downstream consumers (R003/R004/SDKs).
+    uint256 private _nextAgentId = 1;
 
-    /// @dev `internal` so the R002 ERC-8004 layer can align its NFT ownership
-    ///      with this mapping. `private` would force R002 to shadow-store
-    ///      ownership and risk dual-source-of-truth drift on transferFrom.
-    mapping(bytes32 => AgentCard) internal _agents;
+    /// @dev agentId => storage-slot => raw value. The slot is {_metadataSlot} =
+    ///      keccak256(epoch, keccak256(key)) — i.e. the metadata is namespaced by the agent's
+    ///      current {_metadataEpoch}, so a single epoch bump on transfer/burn orphans EVERY key
+    ///      (generic metadata + the reserved agent wallet) in O(1) without an unbounded delete
+    ///      loop. The plaintext key is preserved in the {MetadataSet} event. The agent wallet
+    ///      lives here under {RESERVED_AGENT_WALLET_KEY_HASH} as `abi.encodePacked(address)`.
+    mapping(uint256 => mapping(bytes32 => bytes)) private _metadata;
+
+    /// @dev agentId => current metadata epoch. Incremented on every ownership change (transfer)
+    ///      and on burn, which re-namespaces all of an agent's metadata and thereby resets it to
+    ///      empty for the new owner. A new owner never inherits the previous owner's metadata
+    ///      (capability/venue claims, agent wallet). Old values are not zeroed (no gas refund);
+    ///      they simply become unreachable. Starts at 0; reads/writes use the live epoch.
+    mapping(uint256 => uint256) private _metadataEpoch;
 
     /*//////////////////////////////////////////////////////////////
                                 ERRORS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Thrown when registerAgent is called with an already-used agentId.
-    error AlreadyRegistered(bytes32 agentId);
+    /// @notice Thrown when a non-owner calls an owner-gated mutator.
+    error NotAgentOwner(uint256 agentId, address caller);
 
-    /// @notice Thrown when updateAgent / relinquishAgent is called by a non-owner.
-    error NotOwner(bytes32 agentId, address caller);
+    /// @notice Thrown when a wallet-set signature's deadline is in the past.
+    error SignatureExpired(uint256 deadline);
 
-    /// @notice Thrown when updateAgent / relinquishAgent targets an unregistered agentId.
-    error UnknownAgent(bytes32 agentId);
+    /// @notice Thrown when a wallet-set deadline exceeds the max forward window (replay guard).
+    error DeadlineTooFar(uint256 deadline);
 
-    /// @notice Thrown when registerAgent is called with `agentId == bytes32(0)`.
-    /// @dev Reserves zero as an unambiguous "unset" sentinel for downstream
-    ///      consumers (R003 JobContract's default-initialized `bytes32 providerAgentId`,
-    ///      indexers' "no agent" rows, etc.).
-    error ZeroAgentId();
+    /// @notice Thrown when the wallet-set signature is not valid for `newWallet` (EOA or ERC-1271).
+    error InvalidWalletSignature();
 
-    /// @notice Thrown when register/update is called with `paymentAddress == address(0)`.
-    /// @dev Prevents accidental fund-burn via SDK helpers that forget the field.
-    ///      Owners that genuinely want no-payment should route to a sink they control.
-    error ZeroPaymentAddress();
+    /// @notice Thrown when setMetadata targets a contract-reserved key (e.g. "agentWallet").
+    error ReservedMetadataKey();
 
-    /// @notice Thrown when register/update is called with an empty `name`, `endpoint`,
-    ///         or `metadataURI`. Prevents accidental wipe by half-populated SDK calls.
-    error EmptyField();
-
-    /// @notice Thrown when updateAgent is called with values identical to the stored
-    ///         card. Forces callers to dedupe client-side and keeps event streams clean.
-    error NoChange(bytes32 agentId);
+    constructor() ERC721("Agent Passport", "AGENT") EIP712("ERC8004IdentityRegistry", "1") {}
 
     /*//////////////////////////////////////////////////////////////
-                                EVENTS
+                              REGISTRATION
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Emitted on every successful registerAgent call.
-    /// @dev 3 indexed topics (agentId, owner, paymentAddress) so off-chain indexers
-    ///      can filter by any of them via `eth_getLogs`.
-    event AgentRegistered(
-        bytes32 indexed agentId,
-        address indexed owner,
-        address indexed paymentAddress,
-        string name,
-        string endpoint,
-        string metadataURI,
-        uint64 registeredAt
-    );
-
-    /// @notice Emitted on every successful updateAgent call.
-    /// @dev Symmetric topic set with AgentRegistered (agentId + owner + paymentAddress).
-    event AgentUpdated(
-        bytes32 indexed agentId,
-        address indexed owner,
-        address indexed paymentAddress,
-        string name,
-        string endpoint,
-        string metadataURI
-    );
-
-    /// @notice Emitted when an owner surrenders an agentId. After emission the slot
-    ///         is empty and re-registerable by anyone (the original owner with a
-    ///         fresh key included — supports compromised-key recovery).
-    event AgentRelinquished(bytes32 indexed agentId, address indexed owner);
-
-    /*//////////////////////////////////////////////////////////////
-                            EXTERNAL WRITES
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Register a new agent. The caller becomes the agent's owner.
-    /// @param agentId Caller-chosen unique identifier (e.g. keccak256 of canonical name). MUST be non-zero.
-    /// @param name Human-readable agent name. MUST be non-empty.
-    /// @param endpoint Service endpoint URL (HTTP, MCP, A2A, etc.). MUST be non-empty.
-    /// @param paymentAddress Address that should receive payments routed to this agent. MUST be non-zero.
-    /// @param metadataURI Off-chain pointer (IPFS / HTTPS) to the full Agent Card JSON. MUST be non-empty.
-    function registerAgent(
-        bytes32 agentId,
-        string calldata name,
-        string calldata endpoint,
-        address paymentAddress,
-        string calldata metadataURI
-    ) external {
-        if (agentId == bytes32(0)) revert ZeroAgentId();
-        if (paymentAddress == address(0)) revert ZeroPaymentAddress();
-        if (bytes(name).length == 0 || bytes(endpoint).length == 0 || bytes(metadataURI).length == 0) {
-            revert EmptyField();
+    /// @inheritdoc IIdentityRegistry
+    function register(string calldata agentURI, MetadataEntry[] calldata metadata) external returns (uint256 agentId) {
+        agentId = _prepareAgent(agentURI);
+        for (uint256 i; i < metadata.length; ++i) {
+            _writeMetadata(agentId, metadata[i].key, metadata[i].value);
         }
-        // slither-disable-next-line timestamp — false positive: this is an address comparison, not a timestamp comparison
-        if (_agents[agentId].owner != address(0)) revert AlreadyRegistered(agentId);
-
-        uint64 timestamp = uint64(block.timestamp);
-        _agents[agentId] = AgentCard({
-            owner: msg.sender,
-            registeredAt: timestamp,
-            name: name,
-            endpoint: endpoint,
-            paymentAddress: paymentAddress,
-            metadataURI: metadataURI
-        });
-
-        emit AgentRegistered(agentId, msg.sender, paymentAddress, name, endpoint, metadataURI, timestamp);
+        _safeMint(msg.sender, agentId);
     }
 
-    /// @notice Update an existing agent's metadata. Only the current owner may call this.
-    ///         `owner` and `registeredAt` are immutable post-registration. Reverts with
-    ///         {NoChange} when the new payload equals the stored card — prevents indexer noise.
-    /// @dev Field validation matches {registerAgent}: paymentAddress non-zero, all strings non-empty.
-    /// @param agentId The identifier of the agent to update.
-    /// @param name New name (overwrites previous value).
-    /// @param endpoint New endpoint URL (overwrites previous value).
-    /// @param paymentAddress New payment address (overwrites previous value).
-    /// @param metadataURI New metadata URI (overwrites previous value).
-    function updateAgent(
-        bytes32 agentId,
-        string calldata name,
-        string calldata endpoint,
-        address paymentAddress,
-        string calldata metadataURI
-    ) external {
-        if (agentId == bytes32(0)) revert ZeroAgentId();
-        AgentCard storage card = _agents[agentId];
-        if (card.owner == address(0)) revert UnknownAgent(agentId);
-        if (card.owner != msg.sender) revert NotOwner(agentId, msg.sender);
-        if (paymentAddress == address(0)) revert ZeroPaymentAddress();
-        if (bytes(name).length == 0 || bytes(endpoint).length == 0 || bytes(metadataURI).length == 0) {
-            revert EmptyField();
-        }
-
-        // No-op detection: revert if the payload matches the stored card exactly.
-        // Field-by-field short-circuit AND keeps gas minimal on the common "something changed" path.
-        bool unchanged = card.paymentAddress == paymentAddress && keccak256(bytes(card.name)) == keccak256(bytes(name))
-            && keccak256(bytes(card.endpoint)) == keccak256(bytes(endpoint))
-            && keccak256(bytes(card.metadataURI)) == keccak256(bytes(metadataURI));
-        if (unchanged) revert NoChange(agentId);
-
-        card.name = name;
-        card.endpoint = endpoint;
-        card.paymentAddress = paymentAddress;
-        card.metadataURI = metadataURI;
-
-        emit AgentUpdated(agentId, msg.sender, paymentAddress, name, endpoint, metadataURI);
+    /// @inheritdoc IIdentityRegistry
+    function register(string calldata agentURI) external returns (uint256 agentId) {
+        agentId = _prepareAgent(agentURI);
+        _safeMint(msg.sender, agentId);
     }
 
-    /// @notice Surrender an agentId. After this call the slot is empty and anyone
-    ///         (including the original owner with a fresh key) can re-register it.
-    /// @dev Supports key-compromise recovery: the compromised key relinquishes,
-    ///      a new key re-registers. Attacker who already controls the key can also
-    ///      relinquish, but that's no worse than the existing compromise.
-    /// @param agentId The identifier to surrender. Must be registered to msg.sender.
-    function relinquishAgent(bytes32 agentId) external {
-        if (agentId == bytes32(0)) revert ZeroAgentId();
-        AgentCard storage card = _agents[agentId];
-        if (card.owner == address(0)) revert UnknownAgent(agentId);
-        if (card.owner != msg.sender) revert NotOwner(agentId, msg.sender);
-
-        // card.owner is proven == msg.sender above; emit it directly to avoid
-        // re-reading the slot we're about to delete.
-        delete _agents[agentId];
-        emit AgentRelinquished(agentId, msg.sender);
+    /// @inheritdoc IIdentityRegistry
+    function register() external returns (uint256 agentId) {
+        agentId = _prepareAgent("");
+        _safeMint(msg.sender, agentId);
     }
 
     /*//////////////////////////////////////////////////////////////
-                            EXTERNAL READS
+                            OWNER-GATED MUTATORS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Return the full AgentCard for a given agentId.
-    /// @dev Unknown IDs return an empty struct (owner == address(0)). Never reverts.
-    ///      Prefer {agentOwner} or {exists} for owner-only checks (cheaper).
-    function resolveAgent(bytes32 agentId) external view returns (AgentCard memory card) {
-        return _agents[agentId];
+    /// @inheritdoc IIdentityRegistry
+    function setAgentURI(uint256 agentId, string calldata newURI) external {
+        _requireOwner(agentId);
+        _setTokenURI(agentId, newURI);
+        emit URIUpdated(agentId, newURI, msg.sender);
     }
 
-    /// @notice Cheap owner lookup for other contracts (R003 JobContract, R007 adapters).
-    /// @dev Unknown IDs return `address(0)`. Never reverts. Avoids decoding the full
-    ///      struct (3 dynamic strings) when callers only need ownership.
-    /// @return owner The current owner of `agentId`, or `address(0)` if unregistered.
-    function agentOwner(bytes32 agentId) external view returns (address owner) {
-        return _agents[agentId].owner;
+    /// @inheritdoc IIdentityRegistry
+    function setMetadata(uint256 agentId, string calldata key, bytes calldata value) external {
+        _requireOwner(agentId);
+        _writeMetadata(agentId, key, value);
     }
 
-    /// @notice Cheap existence check.
-    /// @return True if `agentId` has been registered (and not relinquished).
-    function exists(bytes32 agentId) external view returns (bool) {
-        // slither-disable-next-line timestamp — false positive: address comparison, not timestamp
-        return _agents[agentId].owner != address(0);
+    /// @inheritdoc IIdentityRegistry
+    /// @dev The caller must own `agentId`; `newWallet` must authorize via an EIP-712 signature
+    ///      over {AGENT_WALLET_SET_TYPEHASH} (EOA) or ERC-1271 (smart-contract wallet). The
+    ///      `deadline` must be in the future and within {MAX_WALLET_SIG_DELAY}. Emits
+    ///      {MetadataSet} under the "agentWallet" key for off-chain observability.
+    function setAgentWallet(uint256 agentId, address newWallet, uint256 deadline, bytes calldata signature) external {
+        address owner = ownerOf(agentId);
+        if (owner != msg.sender) revert NotAgentOwner(agentId, msg.sender);
+        // Deadline comparison is intentional (a ~5-min signature window); sub-second validator
+        // timestamp drift is immaterial. Suppress both linters' timestamp heuristics.
+        // slither-disable-next-line timestamp
+        if (block.timestamp > deadline) revert SignatureExpired(deadline); // forge-lint: disable-line(block-timestamp)
+        // slither-disable-next-line timestamp
+        if (deadline > block.timestamp + MAX_WALLET_SIG_DELAY) revert DeadlineTooFar(deadline); // forge-lint: disable-line(block-timestamp)
+
+        bytes32 structHash = keccak256(abi.encode(AGENT_WALLET_SET_TYPEHASH, agentId, newWallet, owner, deadline));
+        bytes32 digest = _hashTypedDataV4(structHash);
+        if (!SignatureChecker.isValidSignatureNow(newWallet, digest, signature)) revert InvalidWalletSignature();
+
+        _storeAndEmitWallet(agentId, newWallet);
+    }
+
+    /// @inheritdoc IIdentityRegistry
+    function unsetAgentWallet(uint256 agentId) external {
+        _requireOwner(agentId);
+        _storeAndEmitWallet(agentId, address(0));
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                                 READS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @inheritdoc IIdentityRegistry
+    function getMetadata(uint256 agentId, string calldata key) external view returns (bytes memory) {
+        return _metadata[agentId][_metadataSlot(agentId, keccak256(bytes(key)))];
+    }
+
+    /// @inheritdoc IIdentityRegistry
+    /// @dev Note: reads the reserved "agentWallet" metadata slot and decodes the 20 packed bytes.
+    ///      Returns address(0) for an unset wallet OR an unregistered/burned agentId (no revert).
+    function getAgentWallet(uint256 agentId) external view returns (address) {
+        bytes memory packed = _metadata[agentId][_metadataSlot(agentId, RESERVED_AGENT_WALLET_KEY_HASH)];
+        // forge-lint: disable-next-line(unsafe-typecast) — slot only ever holds 20 packed bytes via _storeAndEmitWallet
+        return packed.length == 20 ? address(bytes20(packed)) : address(0);
+    }
+
+    /// @notice Cheap, non-reverting existence check for downstream consumers (R003/R004/adapters).
+    /// @dev ERC-721 {ownerOf} reverts for unknown ids; this returns false instead. Use it for
+    ///      "is there an agent here?" guards to avoid a revert on the no-agent branch.
+    /// @return True if `agentId` is currently registered (minted and not burned).
+    function exists(uint256 agentId) external view returns (bool) {
+        return _ownerOf(agentId) != address(0);
+    }
+
+    /// @inheritdoc ERC721URIStorage
+    function tokenURI(uint256 tokenId) public view override(ERC721, ERC721URIStorage) returns (string memory) {
+        return super.tokenURI(tokenId);
+    }
+
+    /// @dev supportsInterface mirrors the canonical ERC-8004 reference: detection is via ERC-721 /
+    ///      ERC-721Metadata / ERC-165 (+ ERC-4906 from URIStorage, which we honor by emitting
+    ///      MetadataUpdate in _setTokenURI). ERC-8004 defines NO standardized interfaceId, so we
+    ///      deliberately do NOT advertise a self-derived id — compliance is established by ERC-721
+    ///      detection plus exact selector parity with the reference ABI.
+    function supportsInterface(bytes4 interfaceId) public view override(ERC721, ERC721URIStorage) returns (bool) {
+        return super.supportsInterface(interfaceId);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                                INTERNAL
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Apply all registration EFFECTS for a new agent — assign id, set URI, emit {Registered},
+    ///      default the agent wallet to the owner — BEFORE the caller performs the _safeMint
+    ///      INTERACTION (checks-effects-interactions). At the time the mint's onERC721Received
+    ///      callback fires, the agent is already fully initialized.
+    function _prepareAgent(string memory agentURI) private returns (uint256 agentId) {
+        agentId = _nextAgentId++;
+        _setTokenURI(agentId, agentURI);
+        emit Registered(agentId, agentURI, msg.sender);
+        _storeAndEmitWallet(agentId, msg.sender);
+    }
+
+    /// @dev Single source of truth for writing the agent wallet: stores `abi.encodePacked(wallet)`
+    ///      (20 bytes, or empty for address(0)) under the reserved key and emits {MetadataSet} so
+    ///      every wallet change — including the register-time default — is observable off-chain.
+    function _storeAndEmitWallet(uint256 agentId, address wallet) private {
+        bytes memory packed = wallet == address(0) ? bytes("") : abi.encodePacked(wallet);
+        _metadata[agentId][_metadataSlot(agentId, RESERVED_AGENT_WALLET_KEY_HASH)] = packed;
+        emit MetadataSet(agentId, "agentWallet", "agentWallet", packed);
+    }
+
+    /// @dev Persist a metadata entry (key hashed) and emit {MetadataSet}. Rejects the reserved
+    ///      agent-wallet key so it can only move through {setAgentWallet}/{unsetAgentWallet}.
+    function _writeMetadata(uint256 agentId, string calldata key, bytes calldata value) private {
+        bytes32 keyHash = keccak256(bytes(key));
+        if (keyHash == RESERVED_AGENT_WALLET_KEY_HASH) revert ReservedMetadataKey();
+        _metadata[agentId][_metadataSlot(agentId, keyHash)] = value;
+        emit MetadataSet(agentId, key, key, value);
+    }
+
+    /// @dev Epoch-namespaced storage slot for an agent's metadata key. Mixing the agent's current
+    ///      {_metadataEpoch} into the slot means a single `++epoch` (on transfer/burn) atomically
+    ///      orphans every key without iterating them — avoiding an unbounded delete loop that an
+    ///      agent could grief into a permanently non-transferable token.
+    function _metadataSlot(uint256 agentId, bytes32 keyHash) private view returns (bytes32) {
+        return keccak256(abi.encode(_metadataEpoch[agentId], keyHash));
+    }
+
+    /// @dev Revert unless the caller owns `agentId`. `ownerOf` reverts for unregistered ids.
+    function _requireOwner(uint256 agentId) private view {
+        if (ownerOf(agentId) != msg.sender) revert NotAgentOwner(agentId, msg.sender);
+    }
+
+    /// @dev On a real ownership change (transfer) or burn, bump the agent's metadata epoch. This
+    ///      resets ALL metadata — generic keys AND the verified agent wallet — so nothing persists
+    ///      to a new owner: capability/venue claims become empty and the wallet must be re-set via
+    ///      {setAgentWallet}. O(1): no per-key delete loop (which an agent could grief into an
+    ///      untransferable token). No-op on mint (`from == 0`) and self-transfer (`from == to`).
+    function _update(address to, uint256 tokenId, address auth) internal override(ERC721) returns (address from) {
+        from = super._update(to, tokenId, auth);
+        if (from != address(0) && from != to) {
+            unchecked {
+                ++_metadataEpoch[tokenId];
+            }
+        }
     }
 }

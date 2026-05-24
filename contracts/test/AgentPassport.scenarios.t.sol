@@ -2,138 +2,106 @@
 pragma solidity 0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {AgentPassport} from "../src/AgentPassport.sol";
 
-/// @notice Functional (multi-step + fuzz) scenarios for AgentPassport (R001).
-/// Unit-level FR coverage lives in AgentPassport.t.sol.
+/// @title AgentPassport scenario + fuzz tests (SPEC-R002)
 contract AgentPassportScenariosTest is Test {
-    AgentPassport internal passport;
+    AgentPassport internal registry;
 
     address internal alice = makeAddr("alice");
     address internal bob = makeAddr("bob");
-    address internal charlie = makeAddr("charlie");
+    address internal carol = makeAddr("carol");
 
     function setUp() public {
-        passport = new AgentPassport();
+        registry = new AgentPassport();
     }
 
-    // ---------- F1: full lifecycle, registeredAt is sticky ----------
-
-    function test_Roundtrip_RegisterUpdateResolve() public {
-        bytes32 id = keccak256("vaia-ai");
-
-        vm.warp(1_700_000_000);
+    // F1: register -> transfer -> resolve. URI survives the ownership change.
+    function test_Scenario_RegisterTransferResolve() public {
         vm.prank(alice);
-        passport.registerAgent(id, "vaia-ai", "https://vaia.live/ai", makeAddr("pay1"), "ipfs://v1");
+        uint256 id = registry.register("ipfs://alice");
+        assertEq(registry.ownerOf(id), alice);
 
-        AgentPassport.AgentCard memory afterRegister = passport.resolveAgent(id);
-        assertEq(afterRegister.owner, alice);
-        assertEq(afterRegister.registeredAt, 1_700_000_000);
-        assertEq(afterRegister.metadataURI, "ipfs://v1");
-
-        // simulate time passing — registeredAt must NOT change on update
-        vm.warp(1_700_000_500);
         vm.prank(alice);
-        passport.updateAgent(id, "vaia-ai", "https://vaia.live/ai-v2", makeAddr("pay2"), "ipfs://v2");
+        registry.transferFrom(alice, bob, id);
 
-        AgentPassport.AgentCard memory afterUpdate = passport.resolveAgent(id);
-        assertEq(afterUpdate.owner, alice, "owner sticky");
-        assertEq(afterUpdate.registeredAt, 1_700_000_000, "registeredAt sticky (not 1_700_000_500)");
-        assertEq(afterUpdate.endpoint, "https://vaia.live/ai-v2");
-        assertEq(afterUpdate.metadataURI, "ipfs://v2");
+        assertEq(registry.ownerOf(id), bob, "owner after transfer");
+        assertEq(registry.tokenURI(id), "ipfs://alice", "URI stable across transfer");
     }
 
-    // ---------- F2: storage isolation across agents ----------
-
-    function test_MultiAgent_IsolatedStorage() public {
-        bytes32 idAlice = keccak256("alice-agent");
-        bytes32 idBob = keccak256("bob-agent");
-        bytes32 idCharlie = keccak256("charlie-agent");
-
+    // F2: three agents, isolated state. Updating one touches no other.
+    function test_Scenario_MultiAgent_IsolatedState() public {
         vm.prank(alice);
-        passport.registerAgent(idAlice, "alice", "ep-a", makeAddr("pA"), "uri-a");
+        uint256 a = registry.register("ipfs://alice");
         vm.prank(bob);
-        passport.registerAgent(idBob, "bob", "ep-b", makeAddr("pB"), "uri-b");
-        vm.prank(charlie);
-        passport.registerAgent(idCharlie, "charlie", "ep-c", makeAddr("pC"), "uri-c");
+        uint256 b = registry.register("ipfs://bob");
+        vm.prank(carol);
+        uint256 c = registry.register("ipfs://carol");
 
-        // Update Bob — Alice and Charlie must remain untouched
+        // Bob updates URI + metadata.
         vm.prank(bob);
-        passport.updateAgent(idBob, "bob-v2", "ep-b-v2", makeAddr("pB2"), "uri-b-v2");
+        registry.setAgentURI(b, "ipfs://bob-v2");
+        vm.prank(bob);
+        registry.setMetadata(b, "tag", bytes("updated"));
 
-        AgentPassport.AgentCard memory a = passport.resolveAgent(idAlice);
-        AgentPassport.AgentCard memory b = passport.resolveAgent(idBob);
-        AgentPassport.AgentCard memory c = passport.resolveAgent(idCharlie);
-
-        assertEq(a.name, "alice", "alice untouched by bob's update");
-        assertEq(a.endpoint, "ep-a");
-        assertEq(b.name, "bob-v2", "bob updated");
-        assertEq(b.endpoint, "ep-b-v2");
-        assertEq(c.name, "charlie", "charlie untouched by bob's update");
-        assertEq(c.endpoint, "ep-c");
-
-        assertEq(a.owner, alice);
-        assertEq(b.owner, bob);
-        assertEq(c.owner, charlie);
+        // Alice + Carol untouched.
+        assertEq(registry.tokenURI(a), "ipfs://alice");
+        assertEq(registry.tokenURI(c), "ipfs://carol");
+        assertEq(registry.getMetadata(a, "tag"), bytes(""));
+        assertEq(registry.getMetadata(c, "tag"), bytes(""));
+        assertEq(registry.ownerOf(a), alice);
+        assertEq(registry.ownerOf(c), carol);
     }
 
-    // ---------- F3: owner is msg.sender, not caller-provided ----------
+    // F3: fuzz arbitrary callers + URIs. First registration on a fresh registry is always id 1,
+    // minted to the caller.
+    function testFuzz_RegisterArbitraryURIs(address caller, string calldata uri) public {
+        vm.assume(caller != address(0));
+        vm.assume(caller.code.length == 0); // EOA: _safeMint to a non-receiver contract reverts
+        vm.assume(uint160(caller) > 9); // skip precompiles
+        vm.assume(bytes(uri).length <= 256);
 
-    function test_RegisterFromMultipleSenders_OwnerIsMsgSender() public {
-        bytes32 id1 = keccak256("id-1");
-        bytes32 id2 = keccak256("id-2");
+        vm.prank(caller);
+        uint256 id = registry.register(uri);
 
-        vm.prank(alice);
-        passport.registerAgent(id1, "name-1", "ep-1", makeAddr("p1"), "uri-1");
-
-        vm.prank(bob);
-        passport.registerAgent(id2, "name-2", "ep-2", makeAddr("p2"), "uri-2");
-
-        assertEq(passport.resolveAgent(id1).owner, alice, "id1 owner == alice");
-        assertEq(passport.resolveAgent(id2).owner, bob, "id2 owner == bob");
-
-        // Alice tries to update Bob's agent → must revert
-        vm.expectRevert(abi.encodeWithSelector(AgentPassport.NotOwner.selector, id2, alice));
-        vm.prank(alice);
-        passport.updateAgent(id2, "hijack", "ep", address(0), "uri");
+        assertEq(id, 1, "first registration id");
+        assertEq(registry.ownerOf(id), caller, "owner is caller");
+        assertEq(registry.tokenURI(id), uri, "uri roundtrip");
     }
 
-    // ---------- F4: fuzz on register + ownership invariant ----------
+    // F4: fuzz the owner-gate over arbitrary adversary addresses — no non-owner may mutate.
+    function testFuzz_NonOwnerCannotMutate(address attacker) public {
+        vm.assume(attacker != alice && attacker != address(0));
+        vm.prank(alice);
+        uint256 id = registry.register("ipfs://alice");
 
-    function testFuzz_RegisterArbitraryCards(
-        bytes32 id,
-        address registrant,
-        address attacker,
-        string calldata name,
-        string calldata endpoint,
-        address paymentAddress,
-        string calldata metadataURI
-    ) public {
-        // Filter: contract invariants (non-zero, non-empty, valid VM senders)
-        vm.assume(id != bytes32(0));
-        vm.assume(registrant != address(0) && registrant != address(this) && registrant != address(passport));
-        vm.assume(attacker != address(0) && attacker != address(this) && attacker != address(passport));
-        vm.assume(attacker != registrant);
-        vm.assume(paymentAddress != address(0));
-        vm.assume(bytes(name).length > 0 && bytes(name).length <= 64);
-        vm.assume(bytes(endpoint).length > 0 && bytes(endpoint).length <= 128);
-        vm.assume(bytes(metadataURI).length > 0 && bytes(metadataURI).length <= 128);
-
-        vm.prank(registrant);
-        passport.registerAgent(id, name, endpoint, paymentAddress, metadataURI);
-
-        AgentPassport.AgentCard memory card = passport.resolveAgent(id);
-        assertEq(card.owner, registrant, "owner == registrant (msg.sender)");
-        assertEq(card.name, name, "name roundtrips");
-        assertEq(card.endpoint, endpoint, "endpoint roundtrips");
-        assertEq(card.paymentAddress, paymentAddress, "payment roundtrips");
-        assertEq(card.metadataURI, metadataURI, "uri roundtrips");
-
-        // attacker cannot update (uses different payment to bypass NoChange path)
-        address attackerPayment = address(uint160(paymentAddress) ^ 0xdead);
-        if (attackerPayment == address(0)) attackerPayment = address(0xBEEF);
-        vm.expectRevert(abi.encodeWithSelector(AgentPassport.NotOwner.selector, id, attacker));
+        vm.expectRevert(abi.encodeWithSelector(AgentPassport.NotAgentOwner.selector, id, attacker));
         vm.prank(attacker);
-        passport.updateAgent(id, "hack-name", "evil-endpoint", attackerPayment, "evil-uri");
+        registry.setAgentURI(id, "ipfs://hijack");
+
+        vm.expectRevert(abi.encodeWithSelector(AgentPassport.NotAgentOwner.selector, id, attacker));
+        vm.prank(attacker);
+        registry.setMetadata(id, "k", bytes("v"));
+    }
+
+    // F5: registering from a contract that is not an ERC-721 receiver reverts (safe mint).
+    function test_Register_FromNonReceiverContract_Reverts() public {
+        NonReceiver nr = new NonReceiver(registry);
+        vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721InvalidReceiver.selector, address(nr)));
+        nr.doRegister();
+    }
+}
+
+/// @dev A contract that does NOT implement IERC721Receiver; registering from it must revert.
+contract NonReceiver {
+    AgentPassport private reg;
+
+    constructor(AgentPassport _reg) {
+        reg = _reg;
+    }
+
+    function doRegister() external returns (uint256) {
+        return reg.register("ipfs://nonreceiver");
     }
 }
