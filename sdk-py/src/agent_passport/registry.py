@@ -100,10 +100,12 @@ class IdentityRegistry:
         return int(events[0]["args"]["agentId"])
 
     def set_agent_uri(self, agent_id: int, new_uri: str) -> str:
-        raise NotImplementedError
+        receipt = self._send(self._contract.functions.setAgentURI(agent_id, new_uri))
+        return self._w3.to_hex(receipt["transactionHash"])
 
     def set_metadata(self, agent_id: int, key: str, value: bytes) -> str:
-        raise NotImplementedError
+        receipt = self._send(self._contract.functions.setMetadata(agent_id, key, value))
+        return self._w3.to_hex(receipt["transactionHash"])
 
     def set_agent_wallet(self, agent_id: int, new_wallet: str, signature: bytes, deadline: int) -> str:
         raise NotImplementedError
