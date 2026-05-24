@@ -26,10 +26,14 @@ interface IIdentityRegistry {
     /// @notice Emitted when an agent's URI is changed via {setAgentURI}.
     event URIUpdated(uint256 indexed agentId, string newURI, address indexed updatedBy);
 
-    /// @notice Emitted for every metadata key written via {register} or {setMetadata}.
-    /// @param indexedMetadataKey The key as an indexed topic (filterable); equals `metadataKey`.
+    /// @notice Emitted for every metadata key written via {register}, {setMetadata}, and the
+    ///         reserved "agentWallet" key (register-time default, setAgentWallet, unsetAgentWallet).
+    /// @param indexedMetadataKey The key as an indexed topic. NOTE: because this is an indexed
+    ///        dynamic type, the log TOPIC is `keccak256(bytes(metadataKey))`, NOT the plaintext —
+    ///        filter by the hash. The plaintext is in `metadataKey`.
     /// @param metadataKey The metadata key in plaintext.
-    /// @param metadataValue The raw bytes value.
+    /// @param metadataValue The raw bytes value. For the reserved "agentWallet" key this is the
+    ///        agent wallet as `abi.encodePacked(address)` (20 bytes), or empty bytes when unset.
     event MetadataSet(
         uint256 indexed agentId, string indexed indexedMetadataKey, string metadataKey, bytes metadataValue
     );
@@ -48,19 +52,29 @@ interface IIdentityRegistry {
     function setAgentURI(uint256 agentId, string calldata newURI) external;
 
     /// @notice Set a metadata key on an agent. Owner-gated.
+    /// @dev Generic key→bytes store: writes are last-writer-wins (re-writing a key overwrites it)
+    ///      and an empty `value` clears the key — there is no value validation or change-dedup by
+    ///      design; validate the Agent Card schema off-chain. The reserved key "agentWallet" is
+    ///      rejected (use {setAgentWallet}).
     function setMetadata(uint256 agentId, string calldata key, bytes calldata value) external;
 
-    /// @notice Read a metadata value. Unknown keys return empty bytes (never reverts).
+    /// @notice Read a metadata value. Unknown keys (and unregistered agentIds) return empty bytes,
+    ///         never reverts.
+    /// @dev The reserved key "agentWallet" is readable here and returns the wallet as
+    ///      `abi.encodePacked(address)` (20 bytes); prefer {getAgentWallet} for the typed value.
     function getMetadata(uint256 agentId, string calldata key) external view returns (bytes memory);
 
     /// @notice Set the agent's wallet (payment/operator address, distinct from the NFT owner).
     /// @dev Caller must own `agentId`. `newWallet` authorizes the assignment with an EIP-712
     ///      signature (EOA) or ERC-1271 (smart-contract wallet) over
     ///      `AgentWalletSet(uint256 agentId,address newWallet,address owner,uint256 deadline)`.
-    ///      `deadline` must be in the future and within 5 minutes (replay window).
+    ///      `deadline` must be in the future and within 5 minutes. There is NO nonce (matching the
+    ///      canonical reference): a signature is replayable until its deadline — including
+    ///      re-setting after {unsetAgentWallet} — so an unset is not durable within that window.
+    ///      The `owner` field binds the signature to the current owner, voiding it after transfer.
     function setAgentWallet(uint256 agentId, address newWallet, uint256 deadline, bytes calldata signature) external;
 
-    /// @notice Read the agent's wallet. Returns address(0) if unset.
+    /// @notice Read the agent's wallet. Returns address(0) if unset, unregistered, or burned.
     function getAgentWallet(uint256 agentId) external view returns (address);
 
     /// @notice Clear the agent's wallet. Owner-gated.

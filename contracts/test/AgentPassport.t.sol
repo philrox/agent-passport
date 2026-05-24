@@ -3,6 +3,7 @@ pragma solidity 0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
+import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import {AgentPassport} from "../src/AgentPassport.sol";
 import {IIdentityRegistry} from "../src/interfaces/IIdentityRegistry.sol";
 
@@ -122,6 +123,25 @@ contract AgentPassportTest is Test {
 
         assertEq(registry.getMetadata(id, "capability"), bytes("trading"));
         assertEq(registry.getMetadata(id, "venue"), bytes("polymarket"));
+    }
+
+    // U27: register emits MetadataSet for the wallet-init-to-owner (event-source consistency).
+    function test_Register_EmitsWalletInitMetadataSet() public {
+        vm.expectEmit(true, true, true, true);
+        emit MetadataSet(1, "agentWallet", "agentWallet", abi.encodePacked(alice));
+        vm.prank(alice);
+        registry.register(URI1);
+    }
+
+    // U28: CEI — during the _safeMint receiver callback, the agent is already fully initialized
+    // (URI set, wallet defaulted). Proves effects happen before the external mint interaction.
+    function test_Register_ReentrantReceiver_SeesFullyInitializedState() public {
+        ReentrantRegistrant r = new ReentrantRegistrant(registry);
+        r.doRegister();
+        uint256 id = r.agentId();
+        assertEq(r.observedURI(), "ipfs://recv", "URI must be set before the mint callback (CEI)");
+        assertEq(r.observedWallet(), address(r), "wallet must be inited before the mint callback (CEI)");
+        assertEq(registry.ownerOf(id), address(r));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -346,6 +366,8 @@ contract AgentPassportTest is Test {
         bytes memory sig = _signWallet(id, wallet, alice, deadline, walletPk);
         vm.prank(alice);
         registry.setAgentWallet(id, wallet, deadline, sig);
+        // Pin the pre-transfer state so the post-transfer assert isn't vacuous (init defaults to alice).
+        assertEq(registry.getAgentWallet(id), wallet, "wallet must be set before transfer");
 
         vm.prank(alice);
         registry.transferFrom(alice, bob, id);
@@ -363,15 +385,135 @@ contract AgentPassportTest is Test {
         registry.setMetadata(id, "agentWallet", abi.encodePacked(bob));
     }
 
+    // U29: ERC-1271 wallet that REJECTS the signature -> InvalidWalletSignature (reject path).
+    function test_SetAgentWallet_ERC1271_RejectingWallet_Reverts() public {
+        vm.prank(alice);
+        uint256 id = registry.register(URI1);
+
+        Mock1271Reject scWallet = new Mock1271Reject();
+        uint256 deadline = block.timestamp + 60;
+
+        vm.expectRevert(AgentPassport.InvalidWalletSignature.selector);
+        vm.prank(alice);
+        registry.setAgentWallet(id, address(scWallet), deadline, hex"00");
+    }
+
+    // U30: characterizes the (intentional) replay window — no nonce. A signature is replayable
+    // within its deadline, INCLUDING re-setting after unset. Matches the canonical reference
+    // (replay bounded by owner-binding + 5-min deadline cap). Pinned so a future nonce addition
+    // is a deliberate, test-visible change.
+    function test_SetAgentWallet_SignatureReplayableWithinDeadline() public {
+        vm.prank(alice);
+        uint256 id = registry.register(URI1);
+
+        (address wallet, uint256 walletPk) = makeAddrAndKey("paymentWallet");
+        uint256 deadline = block.timestamp + 60;
+        bytes memory sig = _signWallet(id, wallet, alice, deadline, walletPk);
+
+        vm.prank(alice);
+        registry.setAgentWallet(id, wallet, deadline, sig);
+        vm.prank(alice);
+        registry.unsetAgentWallet(id);
+        assertEq(registry.getAgentWallet(id), address(0));
+
+        // Same signature replays successfully before the deadline (no nonce).
+        vm.prank(alice);
+        registry.setAgentWallet(id, wallet, deadline, sig);
+        assertEq(registry.getAgentWallet(id), wallet, "sig is replayable within deadline (no nonce)");
+    }
+
+    // U31: after the deadline the same signature no longer works.
+    function test_SetAgentWallet_ReplayFailsAfterDeadline() public {
+        vm.prank(alice);
+        uint256 id = registry.register(URI1);
+
+        (address wallet, uint256 walletPk) = makeAddrAndKey("paymentWallet");
+        uint256 deadline = block.timestamp + 60;
+        bytes memory sig = _signWallet(id, wallet, alice, deadline, walletPk);
+        vm.prank(alice);
+        registry.setAgentWallet(id, wallet, deadline, sig);
+
+        vm.warp(deadline + 1);
+        vm.expectRevert(abi.encodeWithSelector(AgentPassport.SignatureExpired.selector, deadline));
+        vm.prank(alice);
+        registry.setAgentWallet(id, wallet, deadline, sig);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                       EXISTS / BURN / UNREGISTERED
+    //////////////////////////////////////////////////////////////*/
+
+    // U32
+    function test_Exists_TrueForRegistered() public {
+        vm.prank(alice);
+        uint256 id = registry.register(URI1);
+        assertTrue(registry.exists(id));
+    }
+
+    // U33
+    function test_Exists_FalseForUnknown() public view {
+        assertFalse(registry.exists(999), "unknown id must not exist (no revert)");
+    }
+
+    // U34: owner can burn (retire); ownerOf reverts, exists() false, wallet cleared.
+    function test_Burn_OwnerCanBurn_ClearsState() public {
+        vm.prank(alice);
+        uint256 id = registry.register(URI1);
+        assertEq(registry.getAgentWallet(id), alice);
+
+        vm.prank(alice);
+        registry.burn(id);
+
+        assertFalse(registry.exists(id), "burned agent must not exist");
+        assertEq(registry.getAgentWallet(id), address(0), "burn must clear the wallet");
+        vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721NonexistentToken.selector, id));
+        registry.ownerOf(id);
+    }
+
+    // U35: non-owner cannot burn.
+    function test_Burn_RevertsForNonOwner() public {
+        vm.prank(alice);
+        uint256 id = registry.register(URI1);
+
+        vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721InsufficientApproval.selector, bob, id));
+        vm.prank(bob);
+        registry.burn(id);
+    }
+
+    // U36: reads against an unregistered id are non-reverting sentinels (return zero/empty).
+    function test_UnregisteredId_ReadsReturnZeroAndEmpty() public view {
+        assertEq(registry.getAgentWallet(12_345), address(0), "unknown wallet -> 0");
+        assertEq(registry.getMetadata(12_345, "anything"), bytes(""), "unknown metadata -> empty");
+    }
+
+    // U37: mutating an unregistered id reverts via ERC-721 ownership check.
+    function test_SetAgentWallet_RevertsForNonexistentAgent() public {
+        (address wallet, uint256 walletPk) = makeAddrAndKey("paymentWallet");
+        uint256 deadline = block.timestamp + 60;
+        bytes memory sig = _signWallet(999, wallet, alice, deadline, walletPk);
+
+        vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721NonexistentToken.selector, uint256(999)));
+        vm.prank(alice);
+        registry.setAgentWallet(999, wallet, deadline, sig);
+    }
+
     /*//////////////////////////////////////////////////////////////
                           INTERFACE / ERRORS
     //////////////////////////////////////////////////////////////*/
 
-    // U16
-    function test_SupportsInterface_ERC721_And_IIdentityRegistry() public view {
+    // U16: supportsInterface matches the canonical ERC-8004 reference (ERC-721 detection only).
+    // ERC-8004 defines no standardized interfaceId, so we deliberately do NOT advertise a
+    // self-derived IIdentityRegistry id (that would be a fake "8004 id" no client checks for).
+    function test_SupportsInterface_MatchesCanonicalReference() public view {
+        assertTrue(registry.supportsInterface(0x01ffc9a7), "must support ERC-165");
         assertTrue(registry.supportsInterface(0x80ac58cd), "must support ERC-721");
         assertTrue(registry.supportsInterface(0x5b5e139f), "must support ERC-721 Metadata");
-        assertTrue(registry.supportsInterface(type(IIdentityRegistry).interfaceId), "must support IIdentityRegistry");
+        assertTrue(registry.supportsInterface(0x49064906), "must support ERC-4906 (URIStorage)");
+        assertFalse(
+            registry.supportsInterface(type(IIdentityRegistry).interfaceId),
+            "must NOT fake a canonical 8004 interfaceId (none exists)"
+        );
+        assertFalse(registry.supportsInterface(0xffffffff), "ERC-165: 0xffffffff must be false");
     }
 
     // U17
@@ -388,9 +530,10 @@ contract AgentPassportTest is Test {
         uint256 gasUsed = gasBefore - gasleft();
         // Sanity: registration actually happened (fails against the empty stub).
         assertEq(registry.ownerOf(id), alice);
-        // Budget pinned from R002 gas report (median ~101k for register(string)); headroom for
-        // short URIs. Guards against silent regression in downstream specs.
-        assertLt(gasUsed, 150_000, "register gas over budget");
+        // Budget pinned from R002 gas report (register(string) median ~124k incl. wallet-init
+        // SSTORE; short-URI exec gas measured ~114k). Tightened to 125k so a cold-SSTORE-sized
+        // regression in a downstream spec actually trips this guard.
+        assertLt(gasUsed, 125_000, "register gas over budget");
     }
 }
 
@@ -398,5 +541,35 @@ contract AgentPassportTest is Test {
 contract Mock1271 {
     function isValidSignature(bytes32, bytes memory) external pure returns (bytes4) {
         return 0x1626ba7e; // ERC-1271 magic value
+    }
+}
+
+/// @dev ERC-1271 wallet that REJECTS every signature (returns a non-magic value).
+contract Mock1271Reject {
+    function isValidSignature(bytes32, bytes memory) external pure returns (bytes4) {
+        return 0xffffffff;
+    }
+}
+
+/// @dev Registers itself and inspects the registry's state DURING the _safeMint callback,
+///      proving effects are applied before the external interaction (CEI).
+contract ReentrantRegistrant is IERC721Receiver {
+    AgentPassport public reg;
+    uint256 public agentId;
+    string public observedURI;
+    address public observedWallet;
+
+    constructor(AgentPassport _reg) {
+        reg = _reg;
+    }
+
+    function doRegister() external {
+        agentId = reg.register("ipfs://recv");
+    }
+
+    function onERC721Received(address, address, uint256 tokenId, bytes calldata) external returns (bytes4) {
+        observedURI = reg.tokenURI(tokenId);
+        observedWallet = reg.getAgentWallet(tokenId);
+        return IERC721Receiver.onERC721Received.selector;
     }
 }

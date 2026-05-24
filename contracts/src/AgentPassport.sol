@@ -3,6 +3,7 @@ pragma solidity 0.8.24;
 
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {ERC721URIStorage} from "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
+import {ERC721Burnable} from "@openzeppelin/contracts/token/ERC721/extensions/ERC721Burnable.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import {IIdentityRegistry} from "./interfaces/IIdentityRegistry.sol";
@@ -13,13 +14,19 @@ import {IIdentityRegistry} from "./interfaces/IIdentityRegistry.sol";
 ///         is its `agentId` (uint256, auto-incremented from 1; 0 is reserved as the
 ///         "unregistered" sentinel). `tokenURI(agentId)` points to the off-chain Agent Card
 ///         JSON (name, capabilities, endpoints). Registration is permissionless; owner-gated
-///         mutators evolve URI/metadata, and ERC-721 transfer hands over the identity.
+///         mutators evolve URI/metadata, ERC-721 transfer hands over the identity, and the owner
+///         can retire it via {burn} (ERC721Burnable).
 /// @dev Implements {IIdentityRegistry} (ERC-8004 Identity Registry surface) on top of OZ
-///      ERC-721 + URIStorage. The agent wallet is set with a signature from the wallet itself
-///      (EIP-712 for EOAs, ERC-1271 for smart-contract wallets), matching the canonical
+///      ERC-721 + URIStorage + Burnable. The agent wallet is set with a signature from the wallet
+///      itself (EIP-712 for EOAs, ERC-1271 for smart-contract wallets), matching the canonical
 ///      erc-8004/erc-8004-contracts implementation. Reputation Registry → R010, Validation
 ///      Registry → R004. Reference: https://eips.ethereum.org/EIPS/eip-8004
-contract AgentPassport is ERC721URIStorage, EIP712, IIdentityRegistry {
+///
+///      Retire/recovery: {burn} retires an identity (ids never recycle; recover by burning and
+///      registering a fresh id, then re-pointing off-chain references). This does NOT defend
+///      against a compromised owner key — whoever holds the key controls (and can burn) the
+///      identity; key-rotation is out of scope, consistent with NFT-based identity in general.
+contract AgentPassport is ERC721, ERC721URIStorage, ERC721Burnable, EIP712, IIdentityRegistry {
     /*//////////////////////////////////////////////////////////////
                                 CONSTANTS
     //////////////////////////////////////////////////////////////*/
@@ -78,20 +85,23 @@ contract AgentPassport is ERC721URIStorage, EIP712, IIdentityRegistry {
 
     /// @inheritdoc IIdentityRegistry
     function register(string calldata agentURI, MetadataEntry[] calldata metadata) external returns (uint256 agentId) {
-        agentId = _mintAgent(agentURI);
+        agentId = _prepareAgent(agentURI);
         for (uint256 i; i < metadata.length; ++i) {
             _writeMetadata(agentId, metadata[i].key, metadata[i].value);
         }
+        _safeMint(msg.sender, agentId);
     }
 
     /// @inheritdoc IIdentityRegistry
     function register(string calldata agentURI) external returns (uint256 agentId) {
-        return _mintAgent(agentURI);
+        agentId = _prepareAgent(agentURI);
+        _safeMint(msg.sender, agentId);
     }
 
     /// @inheritdoc IIdentityRegistry
     function register() external returns (uint256 agentId) {
-        return _mintAgent("");
+        agentId = _prepareAgent("");
+        _safeMint(msg.sender, agentId);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -119,25 +129,26 @@ contract AgentPassport is ERC721URIStorage, EIP712, IIdentityRegistry {
     function setAgentWallet(uint256 agentId, address newWallet, uint256 deadline, bytes calldata signature) external {
         address owner = ownerOf(agentId);
         if (owner != msg.sender) revert NotAgentOwner(agentId, msg.sender);
-        // slither-disable-next-line timestamp — deadline comparison is intentional, not randomness
+        // Deadline comparison is intentional (a ~5-min signature window); sub-second validator
+        // timestamp drift is immaterial. Suppress both linters' timestamp heuristics.
+        // slither-disable-next-line timestamp
+        // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp > deadline) revert SignatureExpired(deadline);
         // slither-disable-next-line timestamp
+        // forge-lint: disable-next-line(block-timestamp)
         if (deadline > block.timestamp + MAX_WALLET_SIG_DELAY) revert DeadlineTooFar(deadline);
 
         bytes32 structHash = keccak256(abi.encode(AGENT_WALLET_SET_TYPEHASH, agentId, newWallet, owner, deadline));
         bytes32 digest = _hashTypedDataV4(structHash);
         if (!SignatureChecker.isValidSignatureNow(newWallet, digest, signature)) revert InvalidWalletSignature();
 
-        bytes memory packed = abi.encodePacked(newWallet);
-        _metadata[agentId][RESERVED_AGENT_WALLET_KEY_HASH] = packed;
-        emit MetadataSet(agentId, "agentWallet", "agentWallet", packed);
+        _storeAndEmitWallet(agentId, newWallet);
     }
 
     /// @inheritdoc IIdentityRegistry
     function unsetAgentWallet(uint256 agentId) external {
         _requireOwner(agentId);
-        delete _metadata[agentId][RESERVED_AGENT_WALLET_KEY_HASH];
-        emit MetadataSet(agentId, "agentWallet", "agentWallet", "");
+        _storeAndEmitWallet(agentId, address(0));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -150,28 +161,58 @@ contract AgentPassport is ERC721URIStorage, EIP712, IIdentityRegistry {
     }
 
     /// @inheritdoc IIdentityRegistry
+    /// @dev Note: reads the reserved "agentWallet" metadata slot and decodes the 20 packed bytes.
+    ///      Returns address(0) for an unset wallet OR an unregistered/burned agentId (no revert).
     function getAgentWallet(uint256 agentId) external view returns (address) {
         bytes memory packed = _metadata[agentId][RESERVED_AGENT_WALLET_KEY_HASH];
+        // forge-lint: disable-next-line(unsafe-typecast) — slot only ever holds 20 packed bytes via _storeAndEmitWallet
         return packed.length == 20 ? address(bytes20(packed)) : address(0);
     }
 
+    /// @notice Cheap, non-reverting existence check for downstream consumers (R003/R004/adapters).
+    /// @dev ERC-721 {ownerOf} reverts for unknown ids; this returns false instead. Use it for
+    ///      "is there an agent here?" guards to avoid a revert on the no-agent branch.
+    /// @return True if `agentId` is currently registered (minted and not burned).
+    function exists(uint256 agentId) external view returns (bool) {
+        return _ownerOf(agentId) != address(0);
+    }
+
     /// @inheritdoc ERC721URIStorage
-    function supportsInterface(bytes4 interfaceId) public view override(ERC721URIStorage) returns (bool) {
-        return interfaceId == type(IIdentityRegistry).interfaceId || super.supportsInterface(interfaceId);
+    function tokenURI(uint256 tokenId) public view override(ERC721, ERC721URIStorage) returns (string memory) {
+        return super.tokenURI(tokenId);
+    }
+
+    /// @dev supportsInterface mirrors the canonical ERC-8004 reference: detection is via ERC-721 /
+    ///      ERC-721Metadata / ERC-165 (+ ERC-4906 from URIStorage, which we honor by emitting
+    ///      MetadataUpdate in _setTokenURI). ERC-8004 defines NO standardized interfaceId, so we
+    ///      deliberately do NOT advertise a self-derived id — compliance is established by ERC-721
+    ///      detection plus exact selector parity with the reference ABI.
+    function supportsInterface(bytes4 interfaceId) public view override(ERC721, ERC721URIStorage) returns (bool) {
+        return super.supportsInterface(interfaceId);
     }
 
     /*//////////////////////////////////////////////////////////////
                                 INTERNAL
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Mint a fresh agent NFT to the caller, set its URI, default the agent wallet to the
-    ///      owner, emit {Registered}. (Wallet init is silent; explicit changes emit {MetadataSet}.)
-    function _mintAgent(string memory agentURI) private returns (uint256 agentId) {
+    /// @dev Apply all registration EFFECTS for a new agent — assign id, set URI, emit {Registered},
+    ///      default the agent wallet to the owner — BEFORE the caller performs the _safeMint
+    ///      INTERACTION (checks-effects-interactions). At the time the mint's onERC721Received
+    ///      callback fires, the agent is already fully initialized.
+    function _prepareAgent(string memory agentURI) private returns (uint256 agentId) {
         agentId = _nextAgentId++;
-        _safeMint(msg.sender, agentId);
         _setTokenURI(agentId, agentURI);
-        _metadata[agentId][RESERVED_AGENT_WALLET_KEY_HASH] = abi.encodePacked(msg.sender);
         emit Registered(agentId, agentURI, msg.sender);
+        _storeAndEmitWallet(agentId, msg.sender);
+    }
+
+    /// @dev Single source of truth for writing the agent wallet: stores `abi.encodePacked(wallet)`
+    ///      (20 bytes, or empty for address(0)) under the reserved key and emits {MetadataSet} so
+    ///      every wallet change — including the register-time default — is observable off-chain.
+    function _storeAndEmitWallet(uint256 agentId, address wallet) private {
+        bytes memory packed = wallet == address(0) ? bytes("") : abi.encodePacked(wallet);
+        _metadata[agentId][RESERVED_AGENT_WALLET_KEY_HASH] = packed;
+        emit MetadataSet(agentId, "agentWallet", "agentWallet", packed);
     }
 
     /// @dev Persist a metadata entry (key hashed) and emit {MetadataSet}. Rejects the reserved
@@ -188,9 +229,9 @@ contract AgentPassport is ERC721URIStorage, EIP712, IIdentityRegistry {
         if (ownerOf(agentId) != msg.sender) revert NotAgentOwner(agentId, msg.sender);
     }
 
-    /// @dev Clear the verified agent wallet on every transfer so it never persists to a new
-    ///      owner (the new owner must re-run {setAgentWallet}). No-op on mint (`from == 0`).
-    function _update(address to, uint256 tokenId, address auth) internal override returns (address from) {
+    /// @dev Clear the verified agent wallet on transfer/burn so it never persists to a new owner
+    ///      (the new owner must re-run {setAgentWallet}). No-op on mint (`from == 0`).
+    function _update(address to, uint256 tokenId, address auth) internal override(ERC721) returns (address from) {
         from = super._update(to, tokenId, auth);
         if (from != address(0) && from != to) {
             delete _metadata[tokenId][RESERVED_AGENT_WALLET_KEY_HASH];
