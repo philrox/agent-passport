@@ -15,7 +15,9 @@ import {IIdentityRegistry} from "./interfaces/IIdentityRegistry.sol";
 ///         "unregistered" sentinel). `tokenURI(agentId)` points to the off-chain Agent Card
 ///         JSON (name, capabilities, endpoints). Registration is permissionless; owner-gated
 ///         mutators evolve URI/metadata, ERC-721 transfer hands over the identity, and the owner
-///         can retire it via {burn} (ERC721Burnable).
+///         can retire it via {burn} (ERC721Burnable). On transfer/burn all metadata (capabilities,
+///         venue claims, agent wallet) is reset — only the `tokenURI` (the identity pointer)
+///         survives; a new owner starts from a clean slate. See {_update}.
 /// @dev Implements {IIdentityRegistry} (ERC-8004 Identity Registry surface) on top of OZ
 ///      ERC-721 + URIStorage + Burnable. The agent wallet is set with a signature from the wallet
 ///      itself (EIP-712 for EOAs, ERC-1271 for smart-contract wallets), matching the canonical
