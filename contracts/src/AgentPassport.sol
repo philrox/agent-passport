@@ -39,6 +39,18 @@ contract AgentPassport is ERC721URIStorage, IIdentityRegistry {
     /// @notice Thrown when a non-owner calls an owner-gated mutator.
     error NotAgentOwner(uint256 agentId, address caller);
 
+    /// @notice Thrown when a wallet-set signature's deadline is in the past.
+    error SignatureExpired(uint256 deadline);
+
+    /// @notice Thrown when a wallet-set deadline exceeds the max forward window (replay guard).
+    error DeadlineTooFar(uint256 deadline);
+
+    /// @notice Thrown when the wallet-set signature is not valid for `newWallet` (EOA or ERC-1271).
+    error InvalidWalletSignature();
+
+    /// @notice Thrown when setMetadata targets a contract-reserved key (e.g. "agentWallet").
+    error ReservedMetadataKey();
+
     constructor() ERC721("Agent Passport", "AGENT") {}
 
     /*//////////////////////////////////////////////////////////////

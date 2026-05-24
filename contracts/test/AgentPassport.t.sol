@@ -25,7 +25,40 @@ contract AgentPassportTest is Test {
     );
 
     function setUp() public {
+        vm.warp(1_700_000_000); // realistic timestamp for deadline checks
         registry = new AgentPassport();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                         EIP-712 SIGNING HELPERS
+    //////////////////////////////////////////////////////////////*/
+
+    bytes32 private constant AGENT_WALLET_SET_TYPEHASH =
+        keccak256("AgentWalletSet(uint256 agentId,address newWallet,address owner,uint256 deadline)");
+
+    /// @dev Reconstructs the registry's EIP-712 domain separator independently (also asserts
+    ///      the contract uses the canonical ERC-8004 domain name/version).
+    function _domainSeparator() internal view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256(bytes("ERC8004IdentityRegistry")),
+                keccak256(bytes("1")),
+                block.chainid,
+                address(registry)
+            )
+        );
+    }
+
+    function _signWallet(uint256 agentId, address newWallet, address owner, uint256 deadline, uint256 pk)
+        internal
+        view
+        returns (bytes memory)
+    {
+        bytes32 structHash = keccak256(abi.encode(AGENT_WALLET_SET_TYPEHASH, agentId, newWallet, owner, deadline));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
+        return abi.encodePacked(r, s, v);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -172,43 +205,162 @@ contract AgentPassportTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
-                             AGENT WALLET
+                       AGENT WALLET (EIP-712 / ERC-1271)
     //////////////////////////////////////////////////////////////*/
 
-    // U13
-    function test_SetAgentWallet_OwnerSets_GetReturns() public {
+    // U13: owner submits, newWallet's EIP-712 signature authorizes. MetadataSet emitted (interop).
+    function test_SetAgentWallet_ValidSig_OwnerSets_GetReturns() public {
         vm.prank(alice);
         uint256 id = registry.register(URI1);
 
-        address wallet = makeAddr("paymentWallet");
+        (address wallet, uint256 walletPk) = makeAddrAndKey("paymentWallet");
+        uint256 deadline = block.timestamp + 60;
+        bytes memory sig = _signWallet(id, wallet, alice, deadline, walletPk);
+
+        vm.expectEmit(true, true, true, true);
+        emit MetadataSet(id, "agentWallet", "agentWallet", abi.encodePacked(wallet));
         vm.prank(alice);
-        registry.setAgentWallet(id, wallet, 0, "");
+        registry.setAgentWallet(id, wallet, deadline, sig);
 
         assertEq(registry.getAgentWallet(id), wallet, "agent wallet must be stored");
+        // Interop: readable via generic getMetadata under the reserved key.
+        assertEq(registry.getMetadata(id, "agentWallet"), abi.encodePacked(wallet));
     }
 
-    // U14
+    // U14: caller authorization is checked before the signature.
     function test_SetAgentWallet_RevertsForNonOwner() public {
         vm.prank(alice);
         uint256 id = registry.register(URI1);
 
+        (address wallet, uint256 walletPk) = makeAddrAndKey("paymentWallet");
+        uint256 deadline = block.timestamp + 60;
+        bytes memory sig = _signWallet(id, wallet, bob, deadline, walletPk);
+
         vm.expectRevert(abi.encodeWithSelector(AgentPassport.NotAgentOwner.selector, id, bob));
         vm.prank(bob);
-        registry.setAgentWallet(id, bob, 0, "");
+        registry.setAgentWallet(id, wallet, deadline, sig);
     }
 
-    // U15
+    // U15: unset needs no signature, owner-gated, resets to zero.
     function test_UnsetAgentWallet_ResetsToZero() public {
         vm.prank(alice);
         uint256 id = registry.register(URI1);
 
-        address wallet = makeAddr("paymentWallet");
+        (address wallet, uint256 walletPk) = makeAddrAndKey("paymentWallet");
+        uint256 deadline = block.timestamp + 60;
+        bytes memory sig = _signWallet(id, wallet, alice, deadline, walletPk);
         vm.prank(alice);
-        registry.setAgentWallet(id, wallet, 0, "");
+        registry.setAgentWallet(id, wallet, deadline, sig);
+
         vm.prank(alice);
         registry.unsetAgentWallet(id);
-
         assertEq(registry.getAgentWallet(id), address(0), "wallet must reset to zero");
+    }
+
+    // U19: expired deadline rejected.
+    function test_SetAgentWallet_RevertsOnExpiredDeadline() public {
+        vm.prank(alice);
+        uint256 id = registry.register(URI1);
+
+        (address wallet, uint256 walletPk) = makeAddrAndKey("paymentWallet");
+        uint256 deadline = block.timestamp - 1;
+        bytes memory sig = _signWallet(id, wallet, alice, deadline, walletPk);
+
+        vm.expectRevert(abi.encodeWithSelector(AgentPassport.SignatureExpired.selector, deadline));
+        vm.prank(alice);
+        registry.setAgentWallet(id, wallet, deadline, sig);
+    }
+
+    // U20: deadline beyond the 5-minute cap rejected (nonce replacement).
+    function test_SetAgentWallet_RevertsOnDeadlineTooFar() public {
+        vm.prank(alice);
+        uint256 id = registry.register(URI1);
+
+        (address wallet, uint256 walletPk) = makeAddrAndKey("paymentWallet");
+        uint256 deadline = block.timestamp + 6 minutes;
+        bytes memory sig = _signWallet(id, wallet, alice, deadline, walletPk);
+
+        vm.expectRevert(abi.encodeWithSelector(AgentPassport.DeadlineTooFar.selector, deadline));
+        vm.prank(alice);
+        registry.setAgentWallet(id, wallet, deadline, sig);
+    }
+
+    // U21: signature from a key other than newWallet rejected.
+    function test_SetAgentWallet_RevertsOnWrongSigner() public {
+        vm.prank(alice);
+        uint256 id = registry.register(URI1);
+
+        (address wallet,) = makeAddrAndKey("paymentWallet");
+        (, uint256 attackerPk) = makeAddrAndKey("attacker");
+        uint256 deadline = block.timestamp + 60;
+        bytes memory sig = _signWallet(id, wallet, alice, deadline, attackerPk);
+
+        vm.expectRevert(AgentPassport.InvalidWalletSignature.selector);
+        vm.prank(alice);
+        registry.setAgentWallet(id, wallet, deadline, sig);
+    }
+
+    // U22: owner-binding — a signature minted for a different owner value is invalid.
+    function test_SetAgentWallet_RevertsIfSignedForDifferentOwner() public {
+        vm.prank(alice);
+        uint256 id = registry.register(URI1);
+
+        (address wallet, uint256 walletPk) = makeAddrAndKey("paymentWallet");
+        uint256 deadline = block.timestamp + 60;
+        // newWallet signs but binds to bob as owner; actual owner is alice -> digest mismatch.
+        bytes memory sig = _signWallet(id, wallet, bob, deadline, walletPk);
+
+        vm.expectRevert(AgentPassport.InvalidWalletSignature.selector);
+        vm.prank(alice);
+        registry.setAgentWallet(id, wallet, deadline, sig);
+    }
+
+    // U23: ERC-1271 smart-contract wallet path.
+    function test_SetAgentWallet_ERC1271_ContractWallet() public {
+        vm.prank(alice);
+        uint256 id = registry.register(URI1);
+
+        Mock1271 scWallet = new Mock1271();
+        uint256 deadline = block.timestamp + 60;
+        // Mock returns the magic value regardless of signature contents.
+        vm.prank(alice);
+        registry.setAgentWallet(id, address(scWallet), deadline, hex"00");
+
+        assertEq(registry.getAgentWallet(id), address(scWallet), "ERC-1271 wallet must be accepted");
+    }
+
+    // U24: register initializes the agent wallet to the owner.
+    function test_Register_InitializesAgentWalletToOwner() public {
+        vm.prank(alice);
+        uint256 id = registry.register(URI1);
+        assertEq(registry.getAgentWallet(id), alice, "wallet must default to owner");
+    }
+
+    // U25: NFT transfer clears the verified wallet (must not persist to new owner).
+    function test_Transfer_ClearsAgentWallet() public {
+        vm.prank(alice);
+        uint256 id = registry.register(URI1);
+
+        (address wallet, uint256 walletPk) = makeAddrAndKey("paymentWallet");
+        uint256 deadline = block.timestamp + 60;
+        bytes memory sig = _signWallet(id, wallet, alice, deadline, walletPk);
+        vm.prank(alice);
+        registry.setAgentWallet(id, wallet, deadline, sig);
+
+        vm.prank(alice);
+        registry.transferFrom(alice, bob, id);
+
+        assertEq(registry.getAgentWallet(id), address(0), "wallet must clear on transfer");
+    }
+
+    // U26: the generic setMetadata cannot spoof the reserved agentWallet key.
+    function test_SetMetadata_RevertsOnReservedAgentWalletKey() public {
+        vm.prank(alice);
+        uint256 id = registry.register(URI1);
+
+        vm.expectRevert(AgentPassport.ReservedMetadataKey.selector);
+        vm.prank(alice);
+        registry.setMetadata(id, "agentWallet", abi.encodePacked(bob));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -239,5 +391,12 @@ contract AgentPassportTest is Test {
         // Budget pinned from R002 gas report (median ~101k for register(string)); headroom for
         // short URIs. Guards against silent regression in downstream specs.
         assertLt(gasUsed, 150_000, "register gas over budget");
+    }
+}
+
+/// @dev Minimal ERC-1271 smart-contract wallet that accepts any signature.
+contract Mock1271 {
+    function isValidSignature(bytes32, bytes memory) external pure returns (bytes4) {
+        return 0x1626ba7e; // ERC-1271 magic value
     }
 }
